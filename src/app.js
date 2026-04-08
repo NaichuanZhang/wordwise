@@ -3,8 +3,9 @@ import { parseDocxFile, extractSentences, extractEnglishWords } from './docx-par
 import { rankWords, findExampleSentence, aggregateFrequencies } from './word-ranker.js'
 import { generateDictionaryEntries } from './ai-dictionary.js'
 import {
-  getCachedFile, saveProcessedFile, getCachedWordEntries, saveWordEntries,
-  getProcessedFiles, deleteProcessedFile, checkFilesExistence, computeFileHash,
+  getCachedFile, getCachedFileByHash, saveProcessedFile, getCachedWordEntries,
+  saveWordEntries, getProcessedFiles, deleteProcessedFile, checkFilesExistence,
+  computeFileHash, uploadFileToStorage, getAllWordEntries, getWordFileCountMap,
 } from './db.js'
 
 let currentUser = null
@@ -164,9 +165,15 @@ async function handleRegister(e) {
   }
 }
 
-// --- Upload View ---
+// --- Main Layout ---
 
-function showUploadView() {
+let selectedFiles = []
+let renderFileListFn = null
+let processBtnRef = null
+let activeTab = 'extract'
+
+function showMainView() {
+  selectedFiles = []
   const app = document.getElementById('app')
   app.innerHTML = `
     <div class="main-container">
@@ -181,7 +188,45 @@ function showUploadView() {
           <button id="logout-btn" class="btn-text">退出</button>
         </div>
       </header>
+      <nav class="app-nav">
+        <button class="nav-tab active" data-tab="extract">提取</button>
+        <button class="nav-tab" data-tab="dictionary">词典</button>
+      </nav>
       <main class="app-main">
+        <div id="tab-content"></div>
+      </main>
+    </div>
+  `
+  document.getElementById('logout-btn').addEventListener('click', async () => {
+    await signOut()
+    currentUser = null
+    showAuthView()
+  })
+  document.querySelectorAll('.nav-tab').forEach((tab) => {
+    tab.addEventListener('click', () => {
+      document.querySelectorAll('.nav-tab').forEach((t) => t.classList.remove('active'))
+      tab.classList.add('active')
+      activeTab = tab.dataset.tab
+      if (activeTab === 'extract') {
+        showExtractTab()
+      } else {
+        showDictionaryTab()
+      }
+    })
+  })
+  showExtractTab()
+}
+
+// Keep old name for compatibility
+function showUploadView() {
+  showMainView()
+}
+
+// --- Extract Tab ---
+
+function showExtractTab() {
+  const content = document.getElementById('tab-content')
+  content.innerHTML = `
         <div class="upload-section">
           <div class="upload-area" id="upload-area">
             <div class="upload-icon">
@@ -200,9 +245,9 @@ function showUploadView() {
             <button id="process-btn" class="btn-primary btn-large" disabled>开始提取</button>
           </div>
         </div>
-        <div class="history-section">
-          <button id="toggle-history-btn" class="btn-text">已处理的文件</button>
-          <div id="history-list" class="history-list hidden"></div>
+        <div class="library-section">
+          <button id="toggle-library-btn" class="btn-text">文件库</button>
+          <div id="library-list" class="library-list hidden"></div>
         </div>
         <div id="progress-section" class="progress-section hidden">
           <div class="progress-bar-container">
@@ -211,64 +256,90 @@ function showUploadView() {
           <p class="progress-text" id="progress-text">准备中...</p>
         </div>
         <div id="results-section" class="results-section hidden"></div>
-      </main>
-    </div>
   `
+  selectedFiles = []
   setupUploadHandlers()
-  document.getElementById('logout-btn').addEventListener('click', async () => {
-    await signOut()
-    currentUser = null
-    showAuthView()
-  })
-  document.getElementById('toggle-history-btn').addEventListener('click', toggleHistory)
+  document.getElementById('toggle-library-btn').addEventListener('click', toggleLibrary)
 }
 
-let historyVisible = false
+let libraryVisible = false
 
-async function toggleHistory() {
-  const historyList = document.getElementById('history-list')
-  if (historyVisible) {
-    historyList.classList.add('hidden')
-    historyVisible = false
+async function toggleLibrary() {
+  const libraryList = document.getElementById('library-list')
+  if (libraryVisible) {
+    libraryList.classList.add('hidden')
+    libraryVisible = false
     return
   }
-  historyVisible = true
-  historyList.classList.remove('hidden')
-  await loadProcessedFilesHistory()
+  libraryVisible = true
+  libraryList.classList.remove('hidden')
+  await loadFileLibrary()
 }
 
-async function loadProcessedFilesHistory() {
-  const historyList = document.getElementById('history-list')
-  historyList.innerHTML = '<p class="loading-text">加载中...</p>'
+async function loadFileLibrary() {
+  const libraryList = document.getElementById('library-list')
+  libraryList.innerHTML = '<p class="loading-text">加载中...</p>'
 
   const files = await getProcessedFiles(currentUser?.id)
 
   if (files.length === 0) {
-    historyList.innerHTML = '<p class="empty-text">暂无已处理的文件</p>'
+    libraryList.innerHTML = '<p class="empty-text">暂无已上传的文件</p>'
     return
   }
 
-  historyList.innerHTML = `
-    <div class="history-items">
-      ${files.map((f) => `
-        <div class="history-item" data-id="${f.id}">
-          <div class="history-item-info">
-            <span class="history-file-name">${escapeHtml(f.file_name)}</span>
-            <span class="history-date">${new Date(f.created_at).toLocaleDateString('zh-CN')}</span>
+  // Check which library files are already in selectedFiles
+  const selectedHashes = new Set(selectedFiles.map((f) => f.hash))
+
+  libraryList.innerHTML = `
+    <div class="library-items">
+      ${files.map((f) => {
+        const alreadySelected = selectedHashes.has(f.file_hash)
+        return `
+          <div class="library-item" data-id="${f.id}" data-hash="${escapeHtml(f.file_hash)}">
+            <label class="library-check-label">
+              <input type="checkbox" class="library-check" data-hash="${escapeHtml(f.file_hash)}" data-name="${escapeHtml(f.file_name)}" ${alreadySelected ? 'checked disabled' : ''} />
+              <div class="library-item-info">
+                <span class="library-file-name">${escapeHtml(f.file_name)}</span>
+                <span class="library-date">${new Date(f.created_at).toLocaleDateString('zh-CN')}</span>
+              </div>
+            </label>
+            <button class="btn-delete-library" data-id="${f.id}" data-storage-key="${escapeHtml(f.storage_key || '')}">删除</button>
           </div>
-          <button class="btn-delete-history" data-id="${f.id}">删除</button>
-        </div>
-      `).join('')}
+        `
+      }).join('')}
+    </div>
+    <div class="library-actions">
+      <button id="add-library-files-btn" class="btn-secondary">添加选中文件到处理队列</button>
     </div>
   `
 
-  document.querySelectorAll('.btn-delete-history').forEach((btn) => {
+  // Add to queue button
+  document.getElementById('add-library-files-btn').addEventListener('click', () => {
+    const checked = document.querySelectorAll('.library-check:checked:not(:disabled)')
+    const newItems = []
+    checked.forEach((cb) => {
+      const hash = cb.dataset.hash
+      const fileName = cb.dataset.name
+      if (!selectedFiles.some((f) => f.hash === hash)) {
+        newItems.push({ file: null, hash, cached: true, fileName, fromLibrary: true })
+      }
+    })
+    if (newItems.length > 0) {
+      selectedFiles = [...selectedFiles, ...newItems]
+      if (renderFileListFn) renderFileListFn()
+      if (processBtnRef) processBtnRef.disabled = selectedFiles.length === 0
+      loadFileLibrary() // refresh checkboxes
+    }
+  })
+
+  // Delete handlers
+  document.querySelectorAll('.btn-delete-library').forEach((btn) => {
     btn.addEventListener('click', async () => {
       btn.disabled = true
       btn.textContent = '删除中...'
       try {
-        await deleteProcessedFile(currentUser?.id, btn.dataset.id)
-        await loadProcessedFilesHistory()
+        await deleteProcessedFile(currentUser?.id, btn.dataset.id, btn.dataset.storageKey || null)
+        await loadFileLibrary()
       } catch {
         btn.disabled = false
         btn.textContent = '删除'
@@ -281,7 +352,7 @@ function setupUploadHandlers() {
   const uploadArea = document.getElementById('upload-area')
   const fileInput = document.getElementById('file-input')
   const processBtn = document.getElementById('process-btn')
-  let selectedFiles = [] // { file, hash, cached }[]
+  processBtnRef = processBtn
 
   uploadArea.addEventListener('click', () => fileInput.click())
   uploadArea.addEventListener('dragover', (e) => { e.preventDefault(); uploadArea.classList.add('drag-over') })
@@ -297,15 +368,13 @@ function setupUploadHandlers() {
     const toAdd = files.slice(0, 50 - selectedFiles.length)
     if (toAdd.length === 0) return
 
-    // Hash files in parallel
     const withHashes = await Promise.all(
       toAdd.map(async (file) => {
         const hash = await computeFileHash(file)
-        return { file, hash, cached: false }
+        return { file, hash, cached: false, fileName: file.name }
       })
     )
 
-    // Batch-check which files are already processed
     const hashes = withHashes.map((f) => f.hash)
     const cachedSet = await checkFilesExistence(currentUser?.id, hashes)
     const items = withHashes.map((item) => ({
@@ -336,10 +405,12 @@ function setupUploadHandlers() {
       <div class="file-items">
         ${selectedFiles.map((item, i) => `
           <div class="file-item">
-            <span class="file-name" title="${item.file.name}">${item.file.name}</span>
-            ${item.cached
-              ? '<span class="file-badge file-badge-cached">已处理</span>'
-              : '<span class="file-badge file-badge-new">新文件</span>'}
+            <span class="file-name" title="${item.fileName}">${item.fileName}</span>
+            ${item.fromLibrary
+              ? '<span class="file-badge file-badge-library">文件库</span>'
+              : item.cached
+                ? '<span class="file-badge file-badge-cached">已处理</span>'
+                : '<span class="file-badge file-badge-new">新文件</span>'}
             <button class="btn-remove" data-index="${i}">&times;</button>
           </div>
         `).join('')}
@@ -350,6 +421,8 @@ function setupUploadHandlers() {
       btn.addEventListener('click', () => removeFile(Number(btn.dataset.index)))
     })
   }
+
+  renderFileListFn = renderFileList
 
   processBtn.addEventListener('click', () => processFiles(selectedFiles))
 }
@@ -374,34 +447,55 @@ async function processFiles(fileItems) {
   try {
     // Step 1: Parse files (with DB caching, per-file error handling)
     for (let i = 0; i < fileItems.length; i++) {
-      const { file } = fileItems[i]
+      const item = fileItems[i]
       const pct = ((i + 1) / totalSteps) * 100
       progressBar.style.width = `${pct}%`
-      progressText.textContent = `正在解析文件 (${i + 1}/${fileItems.length})：${file.name}`
+      progressText.textContent = `正在解析文件 (${i + 1}/${fileItems.length})：${item.fileName}`
 
       try {
         let words, sentences
 
-        // Check cache first
-        const cacheResult = await getCachedFile(userId, file)
-        if (cacheResult.cached) {
-          progressText.textContent = `文件已缓存，跳过解析：${file.name}`
-          words = cacheResult.record.raw_words
-          sentences = cacheResult.record.sentences
+        if (item.fromLibrary) {
+          // Library file — data is in DB, no local file object
+          const record = await getCachedFileByHash(userId, item.hash)
+          if (record) {
+            words = record.raw_words
+            sentences = record.sentences
+          } else {
+            progressText.textContent = `跳过文件（缓存未找到）：${item.fileName}`
+            await new Promise((r) => setTimeout(r, 500))
+            continue
+          }
+        } else if (item.file) {
+          // Local file — check cache, parse if needed
+          const cacheResult = await getCachedFile(userId, item.file)
+          if (cacheResult.cached) {
+            progressText.textContent = `文件已缓存，跳过解析：${item.fileName}`
+            words = cacheResult.record.raw_words
+            sentences = cacheResult.record.sentences
+          } else {
+            const text = await parseDocxFile(item.file)
+            sentences = extractSentences(text)
+            words = extractEnglishWords(text)
+
+            // Upload to storage + save to DB
+            let storageKey = null
+            try {
+              storageKey = await uploadFileToStorage(userId, item.file, cacheResult.hash)
+            } catch { /* storage upload optional */ }
+            try {
+              await saveProcessedFile(userId, item.file, cacheResult.hash, words, sentences, storageKey)
+            } catch { /* ignore duplicate errors */ }
+          }
         } else {
-          const text = await parseDocxFile(file)
-          sentences = extractSentences(text)
-          words = extractEnglishWords(text)
-          try {
-            await saveProcessedFile(userId, file, cacheResult.hash, words, sentences)
-          } catch { /* ignore duplicate errors */ }
+          continue
         }
 
         allSentences.push(...sentences)
         const ranked = rankWords(words)
         allRankedWords.push(...ranked)
       } catch {
-        progressText.textContent = `跳过文件（解析失败）：${file.name}`
+        progressText.textContent = `跳过文件（解析失败）：${item.fileName}`
         await new Promise((r) => setTimeout(r, 1000))
       }
     }
@@ -430,29 +524,23 @@ async function processFiles(fileItems) {
 
     let newEntries = []
     if (uncachedWords.length > 0) {
-      // Build word entries with example sentences for uncached words
       const wordEntriesForAI = uncachedWords.map((word) => ({
         word,
         sentence: findExampleSentence(word, allSentences),
       }))
 
-      // Step 4: Generate via AI
-      const onProgress = (batchNum, totalBatches, done, total) => {
+      const onProgress = (batchNum, totalBatches, done, total, label) => {
         const aiPct = done / total
         const overallPct = ((fileItems.length + 2 + aiPct) / totalSteps) * 100
         progressBar.style.width = `${overallPct}%`
-        progressText.textContent = `正在生成词典条目 (第 ${batchNum}/${totalBatches} 批，已完成 ${done}/${total} 个词)...`
+        const phase = label ? `[${label}] ` : ''
+        progressText.textContent = `${phase}正在生成词典条目 (${done}/${total} 个词)...`
       }
 
       newEntries = await generateDictionaryEntries(wordEntriesForAI, onProgress)
 
-      // Only save entries where all fields are populated
       const successfulEntries = newEntries
         .filter((e) => e.word && e.phonetic && e.pos && e.meaning && e.meaning !== '(生成失败)' && e.example && e.exampleCn)
-        .map((e) => ({
-          ...e,
-          frequency: frequencyMap.get(e.word) || 0,
-        }))
       if (successfulEntries.length > 0) {
         try {
           await saveWordEntries(userId, successfulEntries)
@@ -463,7 +551,6 @@ async function processFiles(fileItems) {
     progressBar.style.width = '100%'
     progressText.textContent = `完成！（${cachedEntries.length} 个词从缓存加载，${newEntries.length} 个词新生成）`
 
-    // Merge cached + new, assign frequencies, sort by frequency desc
     const allEntries = [
       ...cachedEntries.map((e) => ({
         word: e.word,
@@ -473,7 +560,7 @@ async function processFiles(fileItems) {
         example: e.example,
         exampleAnnotated: e.example_annotated || [],
         exampleCn: e.example_cn,
-        frequency: frequencyMap.get(e.word) || e.frequency || 0,
+        frequency: frequencyMap.get(e.word) || 0,
       })),
       ...newEntries.map((e) => ({
         ...e,
@@ -576,6 +663,188 @@ function downloadCSV(entries) {
   const a = document.createElement('a')
   a.href = url
   a.download = `wordwise_${new Date().toISOString().slice(0, 10)}.csv`
+  a.click()
+  URL.revokeObjectURL(url)
+}
+
+// --- Dictionary Tab ---
+
+async function showDictionaryTab() {
+  const content = document.getElementById('tab-content')
+  content.innerHTML = '<p class="loading-text">加载词典...</p>'
+
+  const [rawEntries, fileCountMap] = await Promise.all([
+    getAllWordEntries(currentUser?.id),
+    getWordFileCountMap(currentUser?.id),
+  ])
+  const allEntries = rawEntries.map((e) => ({
+    word: e.word,
+    phonetic: e.phonetic,
+    pos: e.pos,
+    meaning: e.meaning,
+    example: e.example,
+    exampleAnnotated: e.example_annotated || [],
+    exampleCn: e.example_cn,
+    fileCount: fileCountMap.get(e.word.toLowerCase()) || 0,
+  }))
+
+  content.innerHTML = `
+    <div class="dict-header">
+      <h2>词典</h2>
+      <span class="dict-total" id="dict-total">共 ${allEntries.length} 个单词</span>
+    </div>
+    <div class="dict-controls">
+      <input type="text" id="dict-search" class="dict-search" placeholder="搜索单词、释义或例句..." />
+      <div class="dict-filters">
+        <select id="dict-pos-filter" class="dict-select">
+          <option value="">全部词性</option>
+          <option value="n.">n. 名词</option>
+          <option value="v.">v. 动词</option>
+          <option value="adj.">adj. 形容词</option>
+          <option value="adv.">adv. 副词</option>
+          <option value="prep.">prep. 介词</option>
+          <option value="conj.">conj. 连词</option>
+          <option value="pron.">pron. 代词</option>
+        </select>
+        <select id="dict-sort" class="dict-select">
+          <option value="freq-desc">文件数 多→少</option>
+          <option value="freq-asc">文件数 少→多</option>
+          <option value="alpha-asc">字母 A→Z</option>
+          <option value="alpha-desc">字母 Z→A</option>
+          <option value="newest">最新添加</option>
+        </select>
+        <button id="dict-download-btn" class="btn-secondary">下载 CSV</button>
+      </div>
+    </div>
+    <div id="dict-table-container"></div>
+  `
+
+  let currentSearch = ''
+  let currentPos = ''
+  let currentSort = 'freq-desc'
+
+  function getFiltered() {
+    let filtered = allEntries
+
+    if (currentSearch) {
+      const q = currentSearch.toLowerCase()
+      filtered = filtered.filter((e) =>
+        e.word.toLowerCase().includes(q)
+        || e.meaning.toLowerCase().includes(q)
+        || e.example.toLowerCase().includes(q)
+        || (e.exampleCn && e.exampleCn.includes(q))
+      )
+    }
+
+    if (currentPos) {
+      filtered = filtered.filter((e) => e.pos === currentPos)
+    }
+
+    if (currentSort === 'freq-desc') {
+      filtered = [...filtered].sort((a, b) => b.fileCount - a.fileCount)
+    } else if (currentSort === 'freq-asc') {
+      filtered = [...filtered].sort((a, b) => a.fileCount - b.fileCount)
+    } else if (currentSort === 'alpha-asc') {
+      filtered = [...filtered].sort((a, b) => a.word.localeCompare(b.word))
+    } else if (currentSort === 'alpha-desc') {
+      filtered = [...filtered].sort((a, b) => b.word.localeCompare(a.word))
+    }
+    // 'newest' keeps original order (already sorted by created_at desc from DB)
+
+    return filtered
+  }
+
+  function renderDictTable() {
+    const filtered = getFiltered()
+    document.getElementById('dict-total').textContent = `共 ${filtered.length} 个单词`
+    const container = document.getElementById('dict-table-container')
+
+    if (filtered.length === 0) {
+      container.innerHTML = '<p class="empty-text">没有匹配的单词</p>'
+      return
+    }
+
+    container.innerHTML = `
+      <div class="results-table-container">
+        <table class="results-table">
+          <thead>
+            <tr>
+              <th class="col-num">#</th>
+              <th class="col-freq">文件数</th>
+              <th class="col-word">单词</th>
+              <th class="col-phonetic">音标</th>
+              <th class="col-pos">词性</th>
+              <th class="col-meaning">中文意思</th>
+              <th class="col-example">例句</th>
+              <th class="col-example-cn">例句翻译</th>
+            </tr>
+          </thead>
+          <tbody>
+            ${filtered.map((entry, i) => `
+              <tr>
+                <td class="col-num">${i + 1}</td>
+                <td class="col-freq"><span class="freq-badge">${entry.fileCount} 篇</span></td>
+                <td class="col-word"><strong>${escapeHtml(entry.word)}</strong></td>
+                <td class="col-phonetic">${escapeHtml(entry.phonetic)}</td>
+                <td class="col-pos">${escapeHtml(entry.pos)}</td>
+                <td class="col-meaning">${escapeHtml(entry.meaning)}</td>
+                <td class="col-example">${renderAnnotatedExample(entry)}</td>
+                <td class="col-example-cn">${escapeHtml(entry.exampleCn)}</td>
+              </tr>
+            `).join('')}
+          </tbody>
+        </table>
+      </div>
+    `
+  }
+
+  renderDictTable()
+
+  let searchTimer = null
+  document.getElementById('dict-search').addEventListener('input', (e) => {
+    clearTimeout(searchTimer)
+    searchTimer = setTimeout(() => {
+      currentSearch = e.target.value.trim()
+      renderDictTable()
+    }, 200)
+  })
+
+  document.getElementById('dict-pos-filter').addEventListener('change', (e) => {
+    currentPos = e.target.value
+    renderDictTable()
+  })
+
+  document.getElementById('dict-sort').addEventListener('change', (e) => {
+    currentSort = e.target.value
+    renderDictTable()
+  })
+
+  document.getElementById('dict-download-btn').addEventListener('click', () => {
+    downloadDictCSV(getFiltered())
+  })
+}
+
+function downloadDictCSV(entries) {
+  const BOM = '\uFEFF'
+  const header = '序号,文件数,单词,音标,词性,中文意思,例句,例句翻译'
+  const rows = entries.map((entry, i) =>
+    [
+      i + 1,
+      entry.fileCount,
+      csvEscape(entry.word),
+      csvEscape(entry.phonetic),
+      csvEscape(entry.pos),
+      csvEscape(entry.meaning),
+      csvEscape(entry.example),
+      csvEscape(entry.exampleCn),
+    ].join(',')
+  )
+  const csv = BOM + header + '\n' + rows.join('\n')
+  const blob = new Blob([csv], { type: 'text/csv;charset=utf-8;' })
+  const url = URL.createObjectURL(blob)
+  const a = document.createElement('a')
+  a.href = url
+  a.download = `wordwise_词典_${new Date().toISOString().slice(0, 10)}.csv`
   a.click()
   URL.revokeObjectURL(url)
 }

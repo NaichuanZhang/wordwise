@@ -1,34 +1,93 @@
 import { insforge } from './insforge-client.js'
 
 const AI_MODEL = 'deepseek/deepseek-v3.2'
+const FALLBACK_MODEL = 'openai/gpt-4o-mini'
 const BATCH_SIZE = 10
 const CONCURRENCY = 3
+const RETRY_CONCURRENCY = 5
+
+function isFailed(entry) {
+  return !entry.word || !entry.phonetic || !entry.pos
+    || !entry.meaning || entry.meaning === '(生成失败)'
+    || !entry.example || !entry.exampleCn
+}
 
 export async function generateDictionaryEntries(wordEntries, onProgress) {
+  // Pass 1: Batches of 10, 3 concurrent → primary model
+  const pass1Results = await runBatches(wordEntries, BATCH_SIZE, CONCURRENCY, AI_MODEL, onProgress, '生成中')
+
+  // Collect failed entries for retry
+  const succeeded = []
+  const failedWordEntries = []
+  for (const result of pass1Results) {
+    if (isFailed(result)) {
+      const original = wordEntries.find((e) => e.word === result.word)
+      if (original) failedWordEntries.push(original)
+    } else {
+      succeeded.push(result)
+    }
+  }
+
+  if (failedWordEntries.length === 0) return succeeded
+
+  // Pass 2: Individual words, 5 concurrent → primary model
+  if (onProgress) onProgress(0, failedWordEntries.length, succeeded.length, wordEntries.length, '重试中')
+  const pass2Results = await runBatches(failedWordEntries, 1, RETRY_CONCURRENCY, AI_MODEL, (done, total, resultsDone) => {
+    if (onProgress) onProgress(done, total, succeeded.length + resultsDone, wordEntries.length, '重试中')
+  })
+
+  const stillFailed = []
+  for (const result of pass2Results) {
+    if (isFailed(result)) {
+      const original = failedWordEntries.find((e) => e.word === result.word)
+      if (original) stillFailed.push(original)
+    } else {
+      succeeded.push(result)
+    }
+  }
+
+  if (stillFailed.length === 0) return succeeded
+
+  // Pass 3: Individual words, 5 concurrent → fallback model
+  if (onProgress) onProgress(0, stillFailed.length, succeeded.length, wordEntries.length, '备用模型')
+  const pass3Results = await runBatches(stillFailed, 1, RETRY_CONCURRENCY, FALLBACK_MODEL, (done, total, resultsDone) => {
+    if (onProgress) onProgress(done, total, succeeded.length + resultsDone, wordEntries.length, '备用模型')
+  })
+
+  for (const result of pass3Results) {
+    succeeded.push(result)
+  }
+
+  return succeeded
+}
+
+async function runBatches(wordEntries, batchSize, concurrency, model, onProgress, label) {
   const batches = []
-  for (let i = 0; i < wordEntries.length; i += BATCH_SIZE) {
-    batches.push(wordEntries.slice(i, i + BATCH_SIZE))
+  for (let i = 0; i < wordEntries.length; i += batchSize) {
+    batches.push(wordEntries.slice(i, i + batchSize))
   }
 
   const results = []
   let completed = 0
 
-  for (let i = 0; i < batches.length; i += CONCURRENCY) {
-    const wave = batches.slice(i, i + CONCURRENCY)
-    const waveResults = await Promise.all(wave.map(processBatchSafe))
+  for (let i = 0; i < batches.length; i += concurrency) {
+    const wave = batches.slice(i, i + concurrency)
+    const waveResults = await Promise.all(
+      wave.map((batch) => processBatchSafe(batch, model))
+    )
     results.push(...waveResults.flat())
     completed += wave.length
     if (onProgress) {
-      onProgress(completed, batches.length, results.length, wordEntries.length)
+      onProgress(completed, batches.length, results.length, wordEntries.length, label)
     }
   }
 
   return results
 }
 
-async function processBatchSafe(batch) {
+async function processBatchSafe(batch, model) {
   try {
-    return await processBatch(batch)
+    return await processBatch(batch, model)
   } catch {
     return batch.map((entry) => ({
       word: entry.word,
@@ -42,7 +101,7 @@ async function processBatchSafe(batch) {
   }
 }
 
-async function processBatch(wordEntries) {
+async function processBatch(wordEntries, model) {
   const wordList = wordEntries
     .map((entry) => {
       const sentenceInfo = entry.sentence
@@ -89,7 +148,7 @@ async function processBatch(wordEntries) {
 ${wordList}`
 
   const completion = await insforge.ai.chat.completions.create({
-    model: AI_MODEL,
+    model: model || AI_MODEL,
     messages: [{ role: 'user', content: prompt }],
     temperature: 0.3,
     maxTokens: 4000,

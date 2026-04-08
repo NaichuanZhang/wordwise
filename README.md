@@ -1,23 +1,27 @@
 # WordWise (汇) — 智能英语词汇提取
 
-A web app for Chinese English learners that extracts vocabulary from `.docx` documents, ranks words by difficulty, and generates AI-powered dictionary entries with phonetics, example sentences, and translations.
+A web app for Chinese English learners that extracts vocabulary from `.docx` documents, generates AI-powered dictionary entries with phonetics, example sentences, and translations.
 
 ## Features
 
 - Upload `.docx` files (drag & drop, up to 50 files)
+- **File library** — uploaded files stored in cloud storage, reusable across sessions
 - Automatic word extraction with difficulty-based ranking
 - AI-generated dictionary entries: phonetics, part of speech, Chinese meaning, example sentences with per-word phonetic annotations
+- **Cascading retry** — failed AI generations retry individually, then fall back to GPT-4o-mini
+- **Dictionary tab** — browse all persisted words with search, POS filter, and sort
 - Per-user caching — previously processed files and word entries are reused
+- File count metrics — dictionary shows how many files contain each word
 - CSV export for offline study
 - Email/password authentication with OTP verification
 
 ## Tech Stack
 
 - **Frontend**: Vanilla JS + Vite (no framework)
-- **Backend**: [InsForge](https://insforge.com) (auth, Postgres database, AI proxy)
-- **AI Model**: DeepSeek V3.2 via InsForge AI
+- **Backend**: [InsForge](https://insforge.com) (auth, Postgres database, AI proxy, file storage)
+- **AI Models**: DeepSeek V3.2 (primary), GPT-4o-mini (fallback) via InsForge AI
 - **DOCX Parsing**: [Mammoth.js](https://github.com/mwilliamson/mammoth.js)
-- **Hosting**: Vercel
+- **Hosting**: InsForge Deployments (Vercel)
 
 ## Getting Started
 
@@ -45,21 +49,30 @@ flowchart TD
     F --> G[Verified]
     D -- No --> H[Enter Email + Password]
     H --> G
-    G --> I[Upload View]
+    G --> I[Main View]
     B -- Yes --> I
 
-    I --> J[Drag & Drop .docx Files]
-    J --> K[Files Hashed & Cache Checked]
-    K --> L[Click 'Start Extraction']
-    L --> M[Parse & Rank Words]
-    M --> N[AI Generates Dictionary Entries]
-    N --> O[View Results Table]
-    O --> P{Export?}
-    P -- Yes --> Q[Download CSV]
-    P -- No --> R[Done]
+    I --> J[提取 Tab: Upload Files]
+    J --> K1[Drag & Drop .docx Files]
+    J --> K2[Select from File Library]
+    K1 --> L[Files Hashed & Cache Checked]
+    K2 --> L
+    L --> M[Click 'Start Extraction']
+    M --> N[Parse & Rank Words]
+    N --> O[AI Generates Dictionary Entries]
+    O --> O2[Retry Failed Words Individually]
+    O2 --> O3[Fallback Model for Remaining]
+    O3 --> P[View Results Table]
+    P --> Q{Export?}
+    Q -- Yes --> R[Download CSV]
 
-    I --> S[View Processed File History]
-    S --> T[Delete Old Files]
+    I --> S[词典 Tab: Browse All Words]
+    S --> T[Search / Filter / Sort]
+    T --> U[Download Filtered CSV]
+
+    I --> V[File Library]
+    V --> W[Select Files for Processing]
+    V --> X[Delete Old Files]
 ```
 
 ## Data Flow
@@ -77,14 +90,18 @@ flowchart LR
     subgraph InsForge Backend
         DB_CHECK["processed_files table"]
         WORD_CACHE["word_entries table"]
-        AI_PROXY["AI Proxy<br/>(DeepSeek V3.2)"]
+        AI_PROXY["AI Proxy"]
+        STORAGE["File Storage"]
     end
 
+    DOCX -->|upload| STORAGE
     RANKED -->|uncached words| AI_PROXY
-    AI_PROXY -->|JSON: phonetic, POS,<br/>meaning, example,<br/>annotated, translation| ENTRIES["Dictionary Entries"]
+    AI_PROXY -->|Pass 1: batch 10| ENTRIES["Dictionary Entries"]
+    AI_PROXY -->|Pass 2: individual retry| ENTRIES
+    AI_PROXY -->|Pass 3: fallback model| ENTRIES
     ENTRIES -->|upsert| WORD_CACHE
     WORDS -->|save| DB_CHECK
-    WORD_CACHE -->|cached entries| MERGE["Merge & Sort<br/>by Frequency"]
+    WORD_CACHE -->|cached entries| MERGE["Merge & Sort"]
     ENTRIES --> MERGE
     MERGE --> TABLE["Results Table"]
     TABLE -->|export| CSV["CSV Download"]
@@ -111,6 +128,7 @@ erDiagram
         string file_name
         json raw_words
         json sentences
+        string storage_key
         timestamp created_at
     }
 
@@ -124,7 +142,7 @@ erDiagram
         string example
         json example_annotated
         string example_cn
-        int frequency
+        timestamp created_at
     }
 ```
 
@@ -133,12 +151,12 @@ erDiagram
 ```
 src/
 ├── main.js             # Entry point
-├── app.js              # UI rendering & view routing
+├── app.js              # UI rendering, view routing, tabs (extract + dictionary)
 ├── auth.js             # Authentication (InsForge auth)
-├── db.js               # Database operations & file hashing
+├── db.js               # Database operations, file hashing, storage
 ├── docx-parser.js      # .docx text extraction
 ├── word-ranker.js      # Word difficulty scoring & ranking
-├── ai-dictionary.js    # AI-powered dictionary generation
+├── ai-dictionary.js    # AI dictionary generation with cascading retry
 ├── insforge-client.js  # InsForge SDK client
 └── style.css           # Styles (warm palette, responsive)
 ```
