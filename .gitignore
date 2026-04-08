@@ -1,0 +1,26 @@
+node_modules/
+dist/
+.env
+.env.local
+.env.*.local
+.DS_Store
+*.png
+*.jpg
+
+# InsForge & AI agent skills
+.insforge
+.agent
+.agents
+.augment
+.claude
+.cline
+.github/copilot*
+.kilocode
+.kiro
+.qoder
+.qwen
+.roo
+.trae
+.windsurf
+.playwright-mcp
+skills-lock.json
