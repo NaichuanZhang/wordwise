@@ -1,7 +1,7 @@
 import { getCurrentUser, signIn, signUp, signOut, verifyEmail } from './auth.js'
 import { parseDocxFile, extractSentences, extractEnglishWords } from './docx-parser.js'
 import { rankWords, findExampleSentence, aggregateFrequencies } from './word-ranker.js'
-import { generateDictionaryEntries } from './ai-dictionary.js'
+import { generateDictionaryEntries, isFailed } from './ai-dictionary.js'
 import {
   getCachedFile, getCachedFileByHash, saveProcessedFile, getCachedWordEntries,
   saveWordEntries, getProcessedFiles, deleteProcessedFile, checkFilesExistence,
@@ -171,6 +171,10 @@ let selectedFiles = []
 let renderFileListFn = null
 let processBtnRef = null
 let activeTab = 'extract'
+let lastFailedWordEntries = []
+let lastAllSentences = []
+let lastDisplayedEntries = []
+let lastStats = null
 
 function showMainView() {
   selectedFiles = []
@@ -539,20 +543,69 @@ async function processFiles(fileItems) {
 
       newEntries = await generateDictionaryEntries(wordEntriesForAI, onProgress)
 
-      const successfulEntries = newEntries
-        .filter((e) => e.word && e.phonetic && e.pos && e.meaning && e.meaning !== '(生成失败)' && e.example && e.exampleCn)
+      const successfulEntries = newEntries.filter((e) => !isFailed(e))
+      const failedEntries = newEntries.filter((e) => isFailed(e))
+
       if (successfulEntries.length > 0) {
         try {
           await saveWordEntries(userId, successfulEntries)
         } catch { /* ignore save errors */ }
       }
-    }
 
-    progressBar.style.width = '100%'
-    progressText.textContent = `完成！（${cachedEntries.length} 个词从缓存加载，${newEntries.length} 个词新生成）`
+      // Store failed word+sentence pairs for retry
+      lastFailedWordEntries = failedEntries.map((e) => ({
+        word: e.word,
+        sentence: findExampleSentence(e.word, allSentences),
+      }))
+      lastAllSentences = allSentences
 
-    const allEntries = [
-      ...cachedEntries.map((e) => ({
+      const stats = {
+        cachedCount: cachedEntries.length,
+        newSuccessCount: successfulEntries.length,
+        failedCount: failedEntries.length,
+      }
+      lastStats = stats
+
+      progressBar.style.width = '100%'
+      progressText.textContent = `完成！（已缓存 ${stats.cachedCount} 个，新生成 ${stats.newSuccessCount} 个${stats.failedCount > 0 ? `，失败 ${stats.failedCount} 个` : ''}）`
+
+      const allEntries = [
+        ...cachedEntries.map((e) => ({
+          word: e.word,
+          phonetic: e.phonetic,
+          pos: e.pos,
+          meaning: e.meaning,
+          example: e.example,
+          exampleAnnotated: e.example_annotated || [],
+          exampleCn: e.example_cn,
+          frequency: frequencyMap.get(e.word) || 0,
+          failed: false,
+        })),
+        ...successfulEntries.map((e) => ({
+          ...e,
+          frequency: frequencyMap.get(e.word) || 0,
+          failed: false,
+        })),
+        ...failedEntries.map((e) => ({
+          ...e,
+          frequency: frequencyMap.get(e.word) || 0,
+          failed: true,
+        })),
+      ].sort((a, b) => b.frequency - a.frequency)
+
+      lastDisplayedEntries = allEntries
+      showResults(allEntries, stats)
+    } else {
+      // All words were cached, no AI generation needed
+      lastFailedWordEntries = []
+      lastAllSentences = allSentences
+      const stats = { cachedCount: cachedEntries.length, newSuccessCount: 0, failedCount: 0 }
+      lastStats = stats
+
+      progressBar.style.width = '100%'
+      progressText.textContent = `完成！（已缓存 ${stats.cachedCount} 个，无需生成新词条）`
+
+      const allEntries = cachedEntries.map((e) => ({
         word: e.word,
         phonetic: e.phonetic,
         pos: e.pos,
@@ -561,14 +614,12 @@ async function processFiles(fileItems) {
         exampleAnnotated: e.example_annotated || [],
         exampleCn: e.example_cn,
         frequency: frequencyMap.get(e.word) || 0,
-      })),
-      ...newEntries.map((e) => ({
-        ...e,
-        frequency: frequencyMap.get(e.word) || 0,
-      })),
-    ].sort((a, b) => b.frequency - a.frequency)
+        failed: false,
+      })).sort((a, b) => b.frequency - a.frequency)
 
-    showResults(allEntries)
+      lastDisplayedEntries = allEntries
+      showResults(allEntries, stats)
+    }
   } catch (err) {
     progressText.textContent = `处理出错：${err.message}`
     progressBar.style.width = '0%'
@@ -579,18 +630,28 @@ async function processFiles(fileItems) {
 
 // --- Results ---
 
-function showResults(entries) {
+function showResults(entries, stats) {
   const resultsSection = document.getElementById('results-section')
   resultsSection.classList.remove('hidden')
+
+  const successCount = entries.filter((e) => !e.failed).length
+  const failedCount = stats ? stats.failedCount : 0
+
+  const statusParts = []
+  if (stats && stats.cachedCount > 0) statusParts.push(`已缓存 ${stats.cachedCount} 个`)
+  if (stats && stats.newSuccessCount > 0) statusParts.push(`新生成 ${stats.newSuccessCount} 个`)
+  if (failedCount > 0) statusParts.push(`<span class="status-failed">失败 ${failedCount} 个</span>`)
 
   resultsSection.innerHTML = `
     <div class="results-header">
       <h2>提取结果</h2>
       <div class="results-actions">
         <span class="results-count">共 ${entries.length} 个单词</span>
+        ${failedCount > 0 ? '<button id="retry-failed-btn" class="btn-retry">重新生成失败词条</button>' : ''}
         <button id="download-csv-btn" class="btn-secondary">下载 CSV</button>
       </div>
     </div>
+    ${statusParts.length > 0 ? `<div class="results-status">${statusParts.join(' · ')}</div>` : ''}
     <div id="table-container"></div>
   `
 
@@ -612,15 +673,15 @@ function showResults(entries) {
         </thead>
         <tbody>
           ${entries.map((entry, i) => `
-            <tr>
+            <tr class="${entry.failed ? 'row-failed' : ''}">
               <td class="col-num">${i + 1}</td>
               <td class="col-freq"><span class="freq-badge">${entry.frequency}</span></td>
               <td class="col-word"><strong>${escapeHtml(entry.word)}</strong></td>
               <td class="col-phonetic">${escapeHtml(entry.phonetic)}</td>
               <td class="col-pos">${escapeHtml(entry.pos)}</td>
-              <td class="col-meaning">${escapeHtml(entry.meaning)}</td>
-              <td class="col-example">${renderAnnotatedExample(entry)}</td>
-              <td class="col-example-cn">${escapeHtml(entry.exampleCn)}</td>
+              <td class="col-meaning">${entry.failed ? '<span class="badge-failed">生成失败</span>' : escapeHtml(entry.meaning)}</td>
+              <td class="col-example">${entry.failed ? '' : renderAnnotatedExample(entry)}</td>
+              <td class="col-example-cn">${entry.failed ? '' : escapeHtml(entry.exampleCn)}</td>
             </tr>
           `).join('')}
         </tbody>
@@ -628,7 +689,85 @@ function showResults(entries) {
     </div>
   `
 
-  document.getElementById('download-csv-btn').addEventListener('click', () => downloadCSV(entries))
+  document.getElementById('download-csv-btn').addEventListener('click', () => downloadCSV(entries.filter((e) => !e.failed)))
+
+  const retryBtn = document.getElementById('retry-failed-btn')
+  if (retryBtn) {
+    retryBtn.addEventListener('click', retryFailedEntries)
+  }
+}
+
+async function retryFailedEntries() {
+  if (lastFailedWordEntries.length === 0) return
+
+  const retryBtn = document.getElementById('retry-failed-btn')
+  if (retryBtn) {
+    retryBtn.disabled = true
+    retryBtn.textContent = '重试中...'
+  }
+
+  const progressSection = document.getElementById('progress-section')
+  const progressBar = document.getElementById('progress-bar')
+  const progressText = document.getElementById('progress-text')
+  progressSection.classList.remove('hidden')
+  progressBar.style.width = '0%'
+
+  try {
+    const onProgress = (batchNum, totalBatches, done, total, label) => {
+      const pct = (done / total) * 100
+      progressBar.style.width = `${pct}%`
+      const phase = label ? `[${label}] ` : ''
+      progressText.textContent = `${phase}重新生成失败词条 (${done}/${total})...`
+    }
+
+    const retryResults = await generateDictionaryEntries(lastFailedWordEntries, onProgress)
+
+    const newlySucceeded = retryResults.filter((e) => !isFailed(e))
+    const stillFailed = retryResults.filter((e) => isFailed(e))
+
+    if (newlySucceeded.length > 0) {
+      try {
+        await saveWordEntries(currentUser?.id, newlySucceeded)
+      } catch { /* ignore */ }
+    }
+
+    // Update module state
+    lastFailedWordEntries = stillFailed.map((e) => ({
+      word: e.word,
+      sentence: findExampleSentence(e.word, lastAllSentences),
+    }))
+
+    const succeededWords = new Set(newlySucceeded.map((e) => e.word))
+    const updatedEntries = lastDisplayedEntries.map((entry) => {
+      if (entry.failed && succeededWords.has(entry.word)) {
+        const updated = newlySucceeded.find((e) => e.word === entry.word)
+        return { ...entry, ...updated, failed: false }
+      }
+      if (entry.failed && stillFailed.some((e) => e.word === entry.word)) {
+        return entry
+      }
+      return entry
+    })
+
+    const updatedStats = {
+      cachedCount: lastStats ? lastStats.cachedCount : 0,
+      newSuccessCount: (lastStats ? lastStats.newSuccessCount : 0) + newlySucceeded.length,
+      failedCount: stillFailed.length,
+    }
+    lastStats = updatedStats
+    lastDisplayedEntries = updatedEntries
+
+    progressBar.style.width = '100%'
+    progressText.textContent = `重试完成！（成功 ${newlySucceeded.length} 个${stillFailed.length > 0 ? `，仍失败 ${stillFailed.length} 个` : ''}）`
+
+    showResults(updatedEntries, updatedStats)
+  } catch (err) {
+    progressText.textContent = `重试出错：${err.message}`
+    if (retryBtn) {
+      retryBtn.disabled = false
+      retryBtn.textContent = '重新生成失败词条'
+    }
+  }
 }
 
 function renderAnnotatedExample(entry) {

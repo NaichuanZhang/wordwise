@@ -6,7 +6,7 @@ const BATCH_SIZE = 10
 const CONCURRENCY = 3
 const RETRY_CONCURRENCY = 5
 
-function isFailed(entry) {
+export function isFailed(entry) {
   return !entry.word || !entry.phonetic || !entry.pos
     || !entry.meaning || entry.meaning === '(生成失败)'
     || !entry.example || !entry.exampleCn

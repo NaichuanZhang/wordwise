@@ -571,6 +571,66 @@ body {
   color: var(--text-tertiary);
 }
 
+/* ===== Results Status Bar ===== */
+.results-status {
+  display: flex;
+  align-items: center;
+  gap: 0.5rem;
+  padding: 0.6rem 1rem;
+  background: var(--bg-secondary);
+  border-radius: var(--radius-md);
+  font-size: 0.8rem;
+  color: var(--text-secondary);
+  margin-bottom: 1rem;
+}
+
+.status-failed {
+  color: #B91C1C;
+  font-weight: 600;
+}
+
+.btn-retry {
+  padding: 0.55rem 1.2rem;
+  border: 1px solid #FECACA;
+  border-radius: var(--radius-sm);
+  background: #FEF2F2;
+  color: #B91C1C;
+  font-family: var(--font-body);
+  font-size: 0.825rem;
+  font-weight: 500;
+  cursor: pointer;
+  transition: all var(--transition);
+}
+
+.btn-retry:hover:not(:disabled) {
+  background: #FECACA;
+  border-color: #F87171;
+}
+
+.btn-retry:disabled {
+  opacity: 0.5;
+  cursor: not-allowed;
+}
+
+.row-failed {
+  opacity: 0.55;
+}
+
+.row-failed:hover {
+  opacity: 0.75;
+}
+
+.badge-failed {
+  display: inline-block;
+  padding: 0.1rem 0.5rem;
+  border-radius: 99px;
+  font-size: 0.7rem;
+  font-weight: 500;
+  background: #FEF2F2;
+  color: #B91C1C;
+  border: 1px solid #FECACA;
+}
+
 /* ===== Frequency Badge ===== */
 .col-freq {
   width: 60px;
