@@ -75,6 +75,16 @@ export async function checkFilesExistence(userId, fileHashes) {
   return new Set((data || []).map((r) => r.file_hash))
 }
 
+function buildWordFreqMap(words) {
+  const freq = {}
+  for (const w of words) {
+    if (w.length < 3) continue
+    const lower = w.toLowerCase()
+    freq[lower] = (freq[lower] || 0) + 1
+  }
+  return freq
+}
+
 export async function saveProcessedFile(userId, file, hash, rawWords, sentences, storageKey) {
   const { data, error } = await insforge.database
     .from('processed_files')
@@ -85,6 +95,7 @@ export async function saveProcessedFile(userId, file, hash, rawWords, sentences,
       raw_words: rawWords,
       sentences: sentences,
       storage_key: storageKey || null,
+      word_freq: buildWordFreqMap(rawWords),
     }])
     .select()
 
@@ -128,23 +139,22 @@ export async function getAllWordEntries(userId) {
   return data || []
 }
 
-export async function getWordFileCountMap(userId) {
+export async function getWordFrequencyMap(userId) {
   const { data, error } = await insforge.database
     .from('processed_files')
-    .select('raw_words')
+    .select('word_freq')
     .eq('user_id', userId)
 
   if (error || !data) return new Map()
 
-  const countMap = new Map()
+  const freqMap = new Map()
   for (const file of data) {
-    const words = file.raw_words || []
-    const uniqueWords = new Set(words.map((w) => w.toLowerCase()))
-    for (const word of uniqueWords) {
-      countMap.set(word, (countMap.get(word) || 0) + 1)
+    const freq = file.word_freq || {}
+    for (const [word, count] of Object.entries(freq)) {
+      freqMap.set(word, (freqMap.get(word) || 0) + count)
     }
   }
-  return countMap
+  return freqMap
 }
 
 export async function getCachedWordEntries(userId, words) {

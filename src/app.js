@@ -5,7 +5,7 @@ import { generateDictionaryEntries } from './ai-dictionary.js'
 import {
   getCachedFile, getCachedFileByHash, saveProcessedFile, getCachedWordEntries,
   saveWordEntries, getProcessedFiles, deleteProcessedFile, checkFilesExistence,
-  computeFileHash, uploadFileToStorage, getAllWordEntries, getWordFileCountMap,
+  computeFileHash, uploadFileToStorage, getAllWordEntries, getWordFrequencyMap,
 } from './db.js'
 
 let currentUser = null
@@ -673,9 +673,9 @@ async function showDictionaryTab() {
   const content = document.getElementById('tab-content')
   content.innerHTML = '<p class="loading-text">加载词典...</p>'
 
-  const [rawEntries, fileCountMap] = await Promise.all([
+  const [rawEntries, freqMap] = await Promise.all([
     getAllWordEntries(currentUser?.id),
-    getWordFileCountMap(currentUser?.id),
+    getWordFrequencyMap(currentUser?.id),
   ])
   const allEntries = rawEntries.map((e) => ({
     word: e.word,
@@ -685,7 +685,7 @@ async function showDictionaryTab() {
     example: e.example,
     exampleAnnotated: e.example_annotated || [],
     exampleCn: e.example_cn,
-    fileCount: fileCountMap.get(e.word.toLowerCase()) || 0,
+    freq: freqMap.get(e.word.toLowerCase()) || 0,
   }))
 
   content.innerHTML = `
@@ -707,8 +707,8 @@ async function showDictionaryTab() {
           <option value="pron.">pron. 代词</option>
         </select>
         <select id="dict-sort" class="dict-select">
-          <option value="freq-desc">文件数 多→少</option>
-          <option value="freq-asc">文件数 少→多</option>
+          <option value="freq-desc">出现频率 高→低</option>
+          <option value="freq-asc">出现频率 低→高</option>
           <option value="alpha-asc">字母 A→Z</option>
           <option value="alpha-desc">字母 Z→A</option>
           <option value="newest">最新添加</option>
@@ -741,9 +741,9 @@ async function showDictionaryTab() {
     }
 
     if (currentSort === 'freq-desc') {
-      filtered = [...filtered].sort((a, b) => b.fileCount - a.fileCount)
+      filtered = [...filtered].sort((a, b) => b.freq - a.freq)
     } else if (currentSort === 'freq-asc') {
-      filtered = [...filtered].sort((a, b) => a.fileCount - b.fileCount)
+      filtered = [...filtered].sort((a, b) => a.freq - b.freq)
     } else if (currentSort === 'alpha-asc') {
       filtered = [...filtered].sort((a, b) => a.word.localeCompare(b.word))
     } else if (currentSort === 'alpha-desc') {
@@ -770,7 +770,7 @@ async function showDictionaryTab() {
           <thead>
             <tr>
               <th class="col-num">#</th>
-              <th class="col-freq">文件数</th>
+              <th class="col-freq">出现频率</th>
               <th class="col-word">单词</th>
               <th class="col-phonetic">音标</th>
               <th class="col-pos">词性</th>
@@ -783,7 +783,7 @@ async function showDictionaryTab() {
             ${filtered.map((entry, i) => `
               <tr>
                 <td class="col-num">${i + 1}</td>
-                <td class="col-freq"><span class="freq-badge">${entry.fileCount} 篇</span></td>
+                <td class="col-freq"><span class="freq-badge">${entry.freq}</span></td>
                 <td class="col-word"><strong>${escapeHtml(entry.word)}</strong></td>
                 <td class="col-phonetic">${escapeHtml(entry.phonetic)}</td>
                 <td class="col-pos">${escapeHtml(entry.pos)}</td>
@@ -826,11 +826,11 @@ async function showDictionaryTab() {
 
 function downloadDictCSV(entries) {
   const BOM = '\uFEFF'
-  const header = '序号,文件数,单词,音标,词性,中文意思,例句,例句翻译'
+  const header = '序号,出现频率,单词,音标,词性,中文意思,例句,例句翻译'
   const rows = entries.map((entry, i) =>
     [
       i + 1,
-      entry.fileCount,
+      entry.freq,
       csvEscape(entry.word),
       csvEscape(entry.phonetic),
       csvEscape(entry.pos),
