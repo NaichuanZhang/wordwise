@@ -631,6 +631,143 @@ body {
   border: 1px solid #FECACA;
 }
 
+/* ===== Jobs List ===== */
+.jobs-header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  margin-bottom: 0.75rem;
+}
+
+.jobs-header h2 {
+  font-family: var(--font-display);
+  font-size: 1.4rem;
+  font-weight: 400;
+  color: var(--text-primary);
+}
+
+.jobs-list {
+  display: flex;
+  flex-direction: column;
+  gap: 0.5rem;
+  margin-bottom: 2rem;
+}
+
+.job-card {
+  background: var(--bg-card);
+  border: 1px solid var(--border-light);
+  border-radius: var(--radius-md);
+  padding: 0.85rem 1rem;
+  transition: all var(--transition);
+}
+
+.job-card:hover {
+  border-color: var(--border);
+  box-shadow: var(--shadow-sm);
+}
+
+.job-card-done {
+  opacity: 0.85;
+}
+
+.job-card-top {
+  display: flex;
+  justify-content: space-between;
+  align-items: flex-start;
+  margin-bottom: 0.5rem;
+}
+
+.job-info {
+  display: flex;
+  flex-direction: column;
+  gap: 0.15rem;
+  min-width: 0;
+  flex: 1;
+}
+
+.job-files {
+  font-size: 0.825rem;
+  color: var(--text-primary);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.job-date {
+  font-size: 0.725rem;
+  color: var(--text-tertiary);
+}
+
+.job-status {
+  font-size: 0.7rem;
+  font-weight: 600;
+  padding: 0.15rem 0.5rem;
+  border-radius: 99px;
+  white-space: nowrap;
+  flex-shrink: 0;
+  margin-left: 0.5rem;
+}
+
+.job-status-pending {
+  background: #FEF3C7;
+  color: #92400E;
+}
+
+.job-status-processing {
+  background: #DBEAFE;
+  color: #1E40AF;
+  animation: pulse 2s ease-in-out infinite;
+}
+
+@keyframes pulse {
+  0%, 100% { opacity: 1; }
+  50% { opacity: 0.6; }
+}
+
+.job-status-completed {
+  background: #E8F8F0;
+  color: #27AE60;
+}
+
+.job-status-failed {
+  background: #FEF2F2;
+  color: #B91C1C;
+}
+
+.job-card-bottom {
+  display: flex;
+  align-items: center;
+  gap: 0.75rem;
+}
+
+.job-progress-bar {
+  flex: 1;
+  height: 4px;
+  background: var(--bg-secondary);
+  border-radius: 2px;
+  overflow: hidden;
+}
+
+.job-progress-fill {
+  height: 100%;
+  background: linear-gradient(90deg, var(--accent), #D4956E);
+  border-radius: 2px;
+  transition: width 0.5s ease-out;
+}
+
+.job-counts {
+  font-size: 0.725rem;
+  color: var(--text-tertiary);
+  white-space: nowrap;
+  font-family: var(--font-mono);
+}
+
+.job-view-btn {
+  margin-top: 0.35rem;
+  color: var(--accent) !important;
+  font-size: 0.8rem !important;
+}
+
 /* ===== Frequency Badge ===== */
 .col-freq {
   width: 60px;

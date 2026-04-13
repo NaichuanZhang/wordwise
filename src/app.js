@@ -1,11 +1,11 @@
 import { getCurrentUser, signIn, signUp, signOut, verifyEmail } from './auth.js'
 import { parseDocxFile, extractSentences, extractEnglishWords } from './docx-parser.js'
 import { rankWords, findExampleSentence, aggregateFrequencies } from './word-ranker.js'
-import { generateDictionaryEntries, isFailed } from './ai-dictionary.js'
 import {
   getCachedFile, getCachedFileByHash, saveProcessedFile, getCachedWordEntries,
   saveWordEntries, getProcessedFiles, deleteProcessedFile, checkFilesExistence,
   computeFileHash, uploadFileToStorage, getAllWordEntries, getWordFrequencyMap,
+  createExtractionJob, getExtractionJobs, getExtractionJob, triggerJobProcessing,
 } from './db.js'
 
 let currentUser = null
@@ -171,10 +171,7 @@ let selectedFiles = []
 let renderFileListFn = null
 let processBtnRef = null
 let activeTab = 'extract'
-let lastFailedWordEntries = []
-let lastAllSentences = []
-let lastDisplayedEntries = []
-let lastStats = null
+let jobPollTimer = null
 
 function showMainView() {
   selectedFiles = []
@@ -229,6 +226,7 @@ function showUploadView() {
 // --- Extract Tab ---
 
 function showExtractTab() {
+  stopJobPolling()
   const content = document.getElementById('tab-content')
   content.innerHTML = `
         <div class="upload-section">
@@ -259,11 +257,13 @@ function showExtractTab() {
           </div>
           <p class="progress-text" id="progress-text">准备中...</p>
         </div>
+        <div id="jobs-section"></div>
         <div id="results-section" class="results-section hidden"></div>
   `
   selectedFiles = []
   setupUploadHandlers()
   document.getElementById('toggle-library-btn').addEventListener('click', toggleLibrary)
+  loadJobsList()
 }
 
 let libraryVisible = false
@@ -431,28 +431,25 @@ function setupUploadHandlers() {
   processBtn.addEventListener('click', () => processFiles(selectedFiles))
 }
 
-// --- Processing ---
+// --- Processing (Background Job) ---
 
 async function processFiles(fileItems) {
   const progressBar = document.getElementById('progress-bar')
   const progressText = document.getElementById('progress-text')
   const processBtn = document.getElementById('process-btn')
-  const resultsSection = document.getElementById('results-section')
 
   document.getElementById('progress-section').classList.remove('hidden')
-  resultsSection.classList.add('hidden')
   processBtn.disabled = true
 
   const allRankedWords = []
   const allSentences = []
-  const totalSteps = fileItems.length + 3
   const userId = currentUser?.id
 
   try {
-    // Step 1: Parse files (with DB caching, per-file error handling)
+    // Step 1: Parse files client-side
     for (let i = 0; i < fileItems.length; i++) {
       const item = fileItems[i]
-      const pct = ((i + 1) / totalSteps) * 100
+      const pct = ((i + 1) / fileItems.length) * 50
       progressBar.style.width = `${pct}%`
       progressText.textContent = `正在解析文件 (${i + 1}/${fileItems.length})：${item.fileName}`
 
@@ -460,21 +457,16 @@ async function processFiles(fileItems) {
         let words, sentences
 
         if (item.fromLibrary) {
-          // Library file — data is in DB, no local file object
           const record = await getCachedFileByHash(userId, item.hash)
           if (record) {
             words = record.raw_words
             sentences = record.sentences
           } else {
-            progressText.textContent = `跳过文件（缓存未找到）：${item.fileName}`
-            await new Promise((r) => setTimeout(r, 500))
             continue
           }
         } else if (item.file) {
-          // Local file — check cache, parse if needed
           const cacheResult = await getCachedFile(userId, item.file)
           if (cacheResult.cached) {
-            progressText.textContent = `文件已缓存，跳过解析：${item.fileName}`
             words = cacheResult.record.raw_words
             sentences = cacheResult.record.sentences
           } else {
@@ -482,7 +474,6 @@ async function processFiles(fileItems) {
             sentences = extractSentences(text)
             words = extractEnglishWords(text)
 
-            // Upload to storage + save to DB
             let storageKey = null
             try {
               storageKey = await uploadFileToStorage(userId, item.file, cacheResult.hash)
@@ -496,11 +487,10 @@ async function processFiles(fileItems) {
         }
 
         allSentences.push(...sentences)
-        const ranked = rankWords(words)
-        allRankedWords.push(...ranked)
+        allRankedWords.push(...rankWords(words))
       } catch {
         progressText.textContent = `跳过文件（解析失败）：${item.fileName}`
-        await new Promise((r) => setTimeout(r, 1000))
+        await new Promise((r) => setTimeout(r, 500))
       }
     }
 
@@ -510,122 +500,182 @@ async function processFiles(fileItems) {
       return
     }
 
-    // Step 2: Aggregate frequencies across all files
-    progressBar.style.width = `${((fileItems.length + 1) / totalSteps) * 100}%`
+    // Step 2: Find uncached words
+    progressBar.style.width = '60%'
     progressText.textContent = '正在统计词频...'
 
     const frequencyData = aggregateFrequencies(allRankedWords)
-    const frequencyMap = new Map(frequencyData.map((f) => [f.word, f.totalFrequency]))
     const uniqueWords = frequencyData.map((f) => f.word)
-
-    // Step 3: Check DB for existing word entries
-    progressBar.style.width = `${((fileItems.length + 1.5) / totalSteps) * 100}%`
-    progressText.textContent = '检查已有词条...'
 
     const cachedEntries = await getCachedWordEntries(userId, uniqueWords)
     const cachedWordSet = new Set(cachedEntries.map((e) => e.word))
     const uncachedWords = uniqueWords.filter((w) => !cachedWordSet.has(w))
 
-    let newEntries = []
-    if (uncachedWords.length > 0) {
-      const wordEntriesForAI = uncachedWords.map((word) => ({
-        word,
-        sentence: findExampleSentence(word, allSentences),
-      }))
-
-      const onProgress = (batchNum, totalBatches, done, total, label) => {
-        const aiPct = done / total
-        const overallPct = ((fileItems.length + 2 + aiPct) / totalSteps) * 100
-        progressBar.style.width = `${overallPct}%`
-        const phase = label ? `[${label}] ` : ''
-        progressText.textContent = `${phase}正在生成词典条目 (${done}/${total} 个词)...`
-      }
-
-      newEntries = await generateDictionaryEntries(wordEntriesForAI, onProgress)
-
-      const successfulEntries = newEntries.filter((e) => !isFailed(e))
-      const failedEntries = newEntries.filter((e) => isFailed(e))
-
-      if (successfulEntries.length > 0) {
-        try {
-          await saveWordEntries(userId, successfulEntries)
-        } catch { /* ignore save errors */ }
-      }
-
-      // Store failed word+sentence pairs for retry
-      lastFailedWordEntries = failedEntries.map((e) => ({
-        word: e.word,
-        sentence: findExampleSentence(e.word, allSentences),
-      }))
-      lastAllSentences = allSentences
-
-      const stats = {
-        cachedCount: cachedEntries.length,
-        newSuccessCount: successfulEntries.length,
-        failedCount: failedEntries.length,
-      }
-      lastStats = stats
-
+    if (uncachedWords.length === 0) {
       progressBar.style.width = '100%'
-      progressText.textContent = `完成！（已缓存 ${stats.cachedCount} 个，新生成 ${stats.newSuccessCount} 个${stats.failedCount > 0 ? `，失败 ${stats.failedCount} 个` : ''}）`
-
-      const allEntries = [
-        ...cachedEntries.map((e) => ({
-          word: e.word,
-          phonetic: e.phonetic,
-          pos: e.pos,
-          meaning: e.meaning,
-          example: e.example,
-          exampleAnnotated: e.example_annotated || [],
-          exampleCn: e.example_cn,
-          frequency: frequencyMap.get(e.word) || 0,
-          failed: false,
-        })),
-        ...successfulEntries.map((e) => ({
-          ...e,
-          frequency: frequencyMap.get(e.word) || 0,
-          failed: false,
-        })),
-        ...failedEntries.map((e) => ({
-          ...e,
-          frequency: frequencyMap.get(e.word) || 0,
-          failed: true,
-        })),
-      ].sort((a, b) => b.frequency - a.frequency)
-
-      lastDisplayedEntries = allEntries
-      showResults(allEntries, stats)
-    } else {
-      // All words were cached, no AI generation needed
-      lastFailedWordEntries = []
-      lastAllSentences = allSentences
-      const stats = { cachedCount: cachedEntries.length, newSuccessCount: 0, failedCount: 0 }
-      lastStats = stats
-
-      progressBar.style.width = '100%'
-      progressText.textContent = `完成！（已缓存 ${stats.cachedCount} 个，无需生成新词条）`
-
-      const allEntries = cachedEntries.map((e) => ({
-        word: e.word,
-        phonetic: e.phonetic,
-        pos: e.pos,
-        meaning: e.meaning,
-        example: e.example,
-        exampleAnnotated: e.example_annotated || [],
-        exampleCn: e.example_cn,
-        frequency: frequencyMap.get(e.word) || 0,
-        failed: false,
-      })).sort((a, b) => b.frequency - a.frequency)
-
-      lastDisplayedEntries = allEntries
-      showResults(allEntries, stats)
+      progressText.textContent = `所有 ${cachedEntries.length} 个词已缓存，无需生成`
+      processBtn.disabled = false
+      loadJobsList()
+      return
     }
+
+    // Step 3: Create background job for uncached words
+    progressBar.style.width = '80%'
+    progressText.textContent = `创建后台任务（${uncachedWords.length} 个新词需要生成）...`
+
+    const wordEntriesForAI = uncachedWords.map((word) => ({
+      word,
+      sentence: findExampleSentence(word, allSentences),
+    }))
+    const fileNames = fileItems.map((f) => f.fileName)
+
+    const job = await createExtractionJob(userId, fileNames, wordEntriesForAI)
+
+    // Trigger first batch immediately
+    triggerJobProcessing(job.id).catch(() => {})
+
+    progressBar.style.width = '100%'
+    progressText.textContent = `后台任务已创建！${uncachedWords.length} 个词正在生成中，可离开页面`
+
+    processBtn.disabled = false
+    loadJobsList()
   } catch (err) {
     progressText.textContent = `处理出错：${err.message}`
     progressBar.style.width = '0%'
-  } finally {
     processBtn.disabled = false
   }
+}
+
+// --- Jobs List ---
+
+async function loadJobsList() {
+  const jobsSection = document.getElementById('jobs-section')
+  if (!jobsSection) return
+
+  const jobs = await getExtractionJobs(currentUser?.id)
+
+  if (jobs.length === 0) {
+    jobsSection.innerHTML = ''
+    stopJobPolling()
+    return
+  }
+
+  const hasActiveJobs = jobs.some((j) => j.status === 'pending' || j.status === 'processing')
+
+  jobsSection.innerHTML = `
+    <div class="jobs-header">
+      <h2>提取任务</h2>
+    </div>
+    <div class="jobs-list">
+      ${jobs.map((job) => {
+        const statusLabel = getJobStatusLabel(job.status)
+        const pct = job.total_count > 0
+          ? Math.round(((job.completed_count + job.failed_count) / job.total_count) * 100)
+          : 0
+        const date = new Date(job.created_at).toLocaleString('zh-CN', { month: 'short', day: 'numeric', hour: '2-digit', minute: '2-digit' })
+        const fileNames = (job.file_names || []).slice(0, 3).join(', ')
+        const moreFiles = (job.file_names || []).length > 3 ? ` 等${job.file_names.length}个文件` : ''
+
+        return `
+          <div class="job-card ${job.status === 'completed' ? 'job-card-done' : ''}" data-job-id="${job.id}">
+            <div class="job-card-top">
+              <div class="job-info">
+                <span class="job-files" title="${escapeHtml((job.file_names || []).join(', '))}">${escapeHtml(fileNames)}${moreFiles}</span>
+                <span class="job-date">${date}</span>
+              </div>
+              <span class="job-status job-status-${job.status}">${statusLabel}</span>
+            </div>
+            <div class="job-card-bottom">
+              <div class="job-progress-bar"><div class="job-progress-fill" style="width: ${pct}%"></div></div>
+              <span class="job-counts">${job.completed_count}/${job.total_count} 完成${job.failed_count > 0 ? `，${job.failed_count} 失败` : ''}</span>
+            </div>
+            ${job.status === 'completed' || job.completed_count > 0 ? `<button class="btn-text job-view-btn" data-job-id="${job.id}">查看结果</button>` : ''}
+          </div>
+        `
+      }).join('')}
+    </div>
+  `
+
+  // Attach view handlers
+  document.querySelectorAll('.job-view-btn').forEach((btn) => {
+    btn.addEventListener('click', (e) => {
+      e.stopPropagation()
+      viewJobResults(btn.dataset.jobId)
+    })
+  })
+
+  // Start/stop polling based on active jobs
+  if (hasActiveJobs) {
+    startJobPolling()
+  } else {
+    stopJobPolling()
+  }
+}
+
+function getJobStatusLabel(status) {
+  const labels = { pending: '等待中', processing: '处理中', completed: '已完成', failed: '失败' }
+  return labels[status] || status
+}
+
+function startJobPolling() {
+  if (jobPollTimer) return
+  jobPollTimer = setInterval(() => {
+    if (activeTab === 'extract') {
+      loadJobsList()
+    } else {
+      stopJobPolling()
+    }
+  }, 5000)
+}
+
+function stopJobPolling() {
+  if (jobPollTimer) {
+    clearInterval(jobPollTimer)
+    jobPollTimer = null
+  }
+}
+
+async function viewJobResults(jobId) {
+  const resultsSection = document.getElementById('results-section')
+  resultsSection.classList.remove('hidden')
+  resultsSection.innerHTML = '<p class="loading-text">加载结果...</p>'
+
+  const job = await getExtractionJob(jobId)
+  if (!job) {
+    resultsSection.innerHTML = '<p class="empty-text">任务未找到</p>'
+    return
+  }
+
+  const results = (job.results || []).map((e) => ({
+    word: e.word,
+    phonetic: e.phonetic,
+    pos: e.pos,
+    meaning: e.meaning,
+    example: e.example,
+    exampleAnnotated: e.exampleAnnotated || [],
+    exampleCn: e.exampleCn,
+    failed: false,
+  }))
+
+  const failedEntries = (job.failed_words || []).map((word) => ({
+    word,
+    phonetic: '',
+    pos: '',
+    meaning: '(生成失败)',
+    example: '',
+    exampleAnnotated: [],
+    exampleCn: '',
+    failed: true,
+  }))
+
+  const allEntries = [...results, ...failedEntries]
+  const stats = {
+    cachedCount: 0,
+    newSuccessCount: results.length,
+    failedCount: failedEntries.length,
+  }
+
+  showResults(allEntries, stats)
 }
 
 // --- Results ---
@@ -634,12 +684,11 @@ function showResults(entries, stats) {
   const resultsSection = document.getElementById('results-section')
   resultsSection.classList.remove('hidden')
 
-  const successCount = entries.filter((e) => !e.failed).length
   const failedCount = stats ? stats.failedCount : 0
 
   const statusParts = []
   if (stats && stats.cachedCount > 0) statusParts.push(`已缓存 ${stats.cachedCount} 个`)
-  if (stats && stats.newSuccessCount > 0) statusParts.push(`新生成 ${stats.newSuccessCount} 个`)
+  if (stats && stats.newSuccessCount > 0) statusParts.push(`已生成 ${stats.newSuccessCount} 个`)
   if (failedCount > 0) statusParts.push(`<span class="status-failed">失败 ${failedCount} 个</span>`)
 
   resultsSection.innerHTML = `
@@ -647,7 +696,6 @@ function showResults(entries, stats) {
       <h2>提取结果</h2>
       <div class="results-actions">
         <span class="results-count">共 ${entries.length} 个单词</span>
-        ${failedCount > 0 ? '<button id="retry-failed-btn" class="btn-retry">重新生成失败词条</button>' : ''}
         <button id="download-csv-btn" class="btn-secondary">下载 CSV</button>
       </div>
     </div>
@@ -662,7 +710,6 @@ function showResults(entries, stats) {
         <thead>
           <tr>
             <th class="col-num">#</th>
-            <th class="col-freq">频率</th>
             <th class="col-word">单词</th>
             <th class="col-phonetic">音标</th>
             <th class="col-pos">词性</th>
@@ -675,7 +722,6 @@ function showResults(entries, stats) {
           ${entries.map((entry, i) => `
             <tr class="${entry.failed ? 'row-failed' : ''}">
               <td class="col-num">${i + 1}</td>
-              <td class="col-freq"><span class="freq-badge">${entry.frequency}</span></td>
               <td class="col-word"><strong>${escapeHtml(entry.word)}</strong></td>
               <td class="col-phonetic">${escapeHtml(entry.phonetic)}</td>
               <td class="col-pos">${escapeHtml(entry.pos)}</td>
@@ -690,84 +736,6 @@ function showResults(entries, stats) {
   `
 
   document.getElementById('download-csv-btn').addEventListener('click', () => downloadCSV(entries.filter((e) => !e.failed)))
-
-  const retryBtn = document.getElementById('retry-failed-btn')
-  if (retryBtn) {
-    retryBtn.addEventListener('click', retryFailedEntries)
-  }
-}
-
-async function retryFailedEntries() {
-  if (lastFailedWordEntries.length === 0) return
-
-  const retryBtn = document.getElementById('retry-failed-btn')
-  if (retryBtn) {
-    retryBtn.disabled = true
-    retryBtn.textContent = '重试中...'
-  }
-
-  const progressSection = document.getElementById('progress-section')
-  const progressBar = document.getElementById('progress-bar')
-  const progressText = document.getElementById('progress-text')
-  progressSection.classList.remove('hidden')
-  progressBar.style.width = '0%'
-
-  try {
-    const onProgress = (batchNum, totalBatches, done, total, label) => {
-      const pct = (done / total) * 100
-      progressBar.style.width = `${pct}%`
-      const phase = label ? `[${label}] ` : ''
-      progressText.textContent = `${phase}重新生成失败词条 (${done}/${total})...`
-    }
-
-    const retryResults = await generateDictionaryEntries(lastFailedWordEntries, onProgress)
-
-    const newlySucceeded = retryResults.filter((e) => !isFailed(e))
-    const stillFailed = retryResults.filter((e) => isFailed(e))
-
-    if (newlySucceeded.length > 0) {
-      try {
-        await saveWordEntries(currentUser?.id, newlySucceeded)
-      } catch { /* ignore */ }
-    }
-
-    // Update module state
-    lastFailedWordEntries = stillFailed.map((e) => ({
-      word: e.word,
-      sentence: findExampleSentence(e.word, lastAllSentences),
-    }))
-
-    const succeededWords = new Set(newlySucceeded.map((e) => e.word))
-    const updatedEntries = lastDisplayedEntries.map((entry) => {
-      if (entry.failed && succeededWords.has(entry.word)) {
-        const updated = newlySucceeded.find((e) => e.word === entry.word)
-        return { ...entry, ...updated, failed: false }
-      }
-      if (entry.failed && stillFailed.some((e) => e.word === entry.word)) {
-        return entry
-      }
-      return entry
-    })
-
-    const updatedStats = {
-      cachedCount: lastStats ? lastStats.cachedCount : 0,
-      newSuccessCount: (lastStats ? lastStats.newSuccessCount : 0) + newlySucceeded.length,
-      failedCount: stillFailed.length,
-    }
-    lastStats = updatedStats
-    lastDisplayedEntries = updatedEntries
-
-    progressBar.style.width = '100%'
-    progressText.textContent = `重试完成！（成功 ${newlySucceeded.length} 个${stillFailed.length > 0 ? `，仍失败 ${stillFailed.length} 个` : ''}）`
-
-    showResults(updatedEntries, updatedStats)
-  } catch (err) {
-    progressText.textContent = `重试出错：${err.message}`
-    if (retryBtn) {
-      retryBtn.disabled = false
-      retryBtn.textContent = '重新生成失败词条'
-    }
-  }
 }
 
 function renderAnnotatedExample(entry) {

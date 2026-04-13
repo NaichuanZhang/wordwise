@@ -170,6 +170,55 @@ export async function getCachedWordEntries(userId, words) {
   return data || []
 }
 
+// --- Extraction Jobs ---
+
+export async function createExtractionJob(userId, fileNames, words) {
+  const { data, error } = await insforge.database
+    .from('extraction_jobs')
+    .insert([{
+      user_id: userId,
+      file_names: fileNames,
+      words,
+      total_count: words.length,
+      status: 'pending',
+    }])
+    .select()
+
+  if (error) throw new Error(error.message)
+  return data[0]
+}
+
+export async function getExtractionJobs(userId) {
+  const { data, error } = await insforge.database
+    .from('extraction_jobs')
+    .select('*')
+    .eq('user_id', userId)
+    .order('created_at', { ascending: false })
+    .limit(20)
+
+  if (error) return []
+  return data || []
+}
+
+export async function getExtractionJob(jobId) {
+  const { data, error } = await insforge.database
+    .from('extraction_jobs')
+    .select('*')
+    .eq('id', jobId)
+    .limit(1)
+
+  if (error || !data || data.length === 0) return null
+  return data[0]
+}
+
+export async function triggerJobProcessing(jobId) {
+  return insforge.functions.invoke('process-words', {
+    body: { job_id: jobId },
+  })
+}
+
+// --- Word Entries ---
+
 export async function saveWordEntries(userId, entries) {
   if (entries.length === 0) return
 
