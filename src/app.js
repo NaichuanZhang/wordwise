@@ -5,7 +5,7 @@ import {
   getCachedFile, getCachedFileByHash, saveProcessedFile, getCachedWordEntries,
   saveWordEntries, getProcessedFiles, deleteProcessedFile, checkFilesExistence,
   computeFileHash, uploadFileToStorage, getAllWordEntries, getWordFrequencyMap,
-  createExtractionJob, getExtractionJobs, getExtractionJob, triggerJobProcessing,
+  createExtractionJob, getExtractionJobs, getExtractionJob, triggerJobProcessing, cancelExtractionJob,
 } from './db.js'
 
 let currentUser = null
@@ -579,13 +579,16 @@ async function loadJobsList() {
         const moreFiles = (job.file_names || []).length > 3 ? ` 等${job.file_names.length}个文件` : ''
 
         return `
-          <div class="job-card ${job.status === 'completed' ? 'job-card-done' : ''}" data-job-id="${job.id}">
+          <div class="job-card ${job.status === 'completed' || job.status === 'cancelled' ? 'job-card-done' : ''}" data-job-id="${job.id}">
             <div class="job-card-top">
               <div class="job-info">
                 <span class="job-files" title="${escapeHtml((job.file_names || []).join(', '))}">${escapeHtml(fileNames)}${moreFiles}</span>
                 <span class="job-date">${date}</span>
               </div>
-              <span class="job-status job-status-${job.status}">${statusLabel}</span>
+              <div class="job-card-actions">
+                <span class="job-status job-status-${job.status}">${statusLabel}</span>
+                ${job.status === 'pending' || job.status === 'processing' ? `<button class="btn-cancel-job" data-job-id="${job.id}">取消</button>` : ''}
+              </div>
             </div>
             <div class="job-card-bottom">
               <div class="job-progress-bar"><div class="job-progress-fill" style="width: ${pct}%"></div></div>
@@ -605,6 +608,22 @@ async function loadJobsList() {
     })
   })
 
+  // Cancel button handlers
+  document.querySelectorAll('.btn-cancel-job').forEach((btn) => {
+    btn.addEventListener('click', async (e) => {
+      e.stopPropagation()
+      btn.disabled = true
+      btn.textContent = '取消中...'
+      try {
+        await cancelExtractionJob(btn.dataset.jobId)
+        await loadJobsList()
+      } catch {
+        btn.disabled = false
+        btn.textContent = '取消'
+      }
+    })
+  })
+
   // Start/stop polling based on active jobs
   if (hasActiveJobs) {
     startJobPolling()
@@ -614,7 +633,7 @@ async function loadJobsList() {
 }
 
 function getJobStatusLabel(status) {
-  const labels = { pending: '等待中', processing: '处理中', completed: '已完成', failed: '失败' }
+  const labels = { pending: '等待中', processing: '处理中', completed: '已完成', failed: '失败', cancelled: '已取消' }
   return labels[status] || status
 }
 
@@ -686,7 +705,10 @@ function renderJobDetail(job) {
           <h2 class="job-detail-title">${escapeHtml(fileNames)}</h2>
           <span class="job-detail-date">${createdDate}</span>
         </div>
-        <span class="job-status job-status-${job.status}">${statusLabel}</span>
+        <div class="job-card-actions">
+          <span class="job-status job-status-${job.status}">${statusLabel}</span>
+          ${isActive ? `<button class="btn-cancel-job" id="btn-cancel-detail">取消任务</button>` : ''}
+        </div>
       </div>
 
       <div class="job-viz">
@@ -745,6 +767,22 @@ function renderJobDetail(job) {
     resultsSection.innerHTML = ''
     loadJobsList()
   })
+
+  const cancelDetailBtn = document.getElementById('btn-cancel-detail')
+  if (cancelDetailBtn) {
+    cancelDetailBtn.addEventListener('click', async () => {
+      cancelDetailBtn.disabled = true
+      cancelDetailBtn.textContent = '取消中...'
+      try {
+        await cancelExtractionJob(job.id)
+        stopJobDetailPolling()
+        showJobDetail(job.id) // re-render with cancelled state
+      } catch {
+        cancelDetailBtn.disabled = false
+        cancelDetailBtn.textContent = '取消任务'
+      }
+    })
+  }
 
   // Popover click handler for completed word pills
   setupWordPillPopovers(results)

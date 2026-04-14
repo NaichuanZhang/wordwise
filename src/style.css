@@ -961,6 +961,41 @@ body {
   color: #B91C1C;
 }
 
+.job-status-cancelled {
+  background: var(--bg-secondary);
+  color: var(--text-tertiary);
+}
+
+.job-card-actions {
+  display: flex;
+  align-items: center;
+  gap: 0.5rem;
+  flex-shrink: 0;
+}
+
+.btn-cancel-job {
+  border: 1px solid var(--border);
+  background: var(--bg-card);
+  color: var(--text-secondary);
+  font-family: var(--font-body);
+  font-size: 0.7rem;
+  padding: 0.2rem 0.5rem;
+  border-radius: var(--radius-sm);
+  cursor: pointer;
+  transition: all var(--transition);
+}
+
+.btn-cancel-job:hover:not(:disabled) {
+  border-color: #B91C1C;
+  color: #B91C1C;
+  background: #FEF2F2;
+}
+
+.btn-cancel-job:disabled {
+  opacity: 0.5;
+  cursor: not-allowed;
+}
+
 .job-card-bottom {
   display: flex;
   align-items: center;

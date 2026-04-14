@@ -211,6 +211,15 @@ export async function getExtractionJob(jobId) {
   return data[0]
 }
 
+export async function cancelExtractionJob(jobId) {
+  const { error } = await insforge.database
+    .from('extraction_jobs')
+    .update({ status: 'cancelled', updated_at: new Date().toISOString() })
+    .eq('id', jobId)
+
+  if (error) throw new Error(error.message)
+}
+
 export async function triggerJobProcessing(jobId) {
   return insforge.functions.invoke('process-words', {
     body: { job_id: jobId },
