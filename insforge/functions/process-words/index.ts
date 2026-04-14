@@ -1,5 +1,67 @@
 import { createClient } from 'npm:@insforge/sdk'
-import { annotateExample } from './phonetic-annotator.ts'
+import * as cmuModule from 'npm:cmu-pronouncing-dictionary'
+import { toIPA } from 'npm:arpabet-and-ipa-convertor-ts'
+
+// --- Phonetic Annotator (CMU Dict → IPA) ---
+
+let ipaDict: Map<string, string> | null = null
+
+function getIpaDict(): Map<string, string> {
+  if (ipaDict) return ipaDict
+
+  const cmuDict: Record<string, string> = cmuModule.dictionary ?? cmuModule
+  ipaDict = new Map()
+
+  for (const [word, arpabet] of Object.entries(cmuDict)) {
+    try {
+      const rawIpa = toIPA(arpabet)
+      const ipa = fixSchwa(arpabet, rawIpa)
+      ipaDict.set(word, `/${ipa}/`)
+    } catch {
+      // Skip entries that fail conversion
+    }
+  }
+
+  return ipaDict
+}
+
+function fixSchwa(arpabet: string, ipa: string): string {
+  const phones = arpabet.split(' ')
+  let result = ipa
+  let searchFrom = 0
+
+  for (const phone of phones) {
+    if (phone === 'AH0') {
+      const idx = result.indexOf('ʌ', searchFrom)
+      if (idx !== -1) {
+        result = result.slice(0, idx) + 'ə' + result.slice(idx + 1)
+        searchFrom = idx + 1
+      }
+    } else if (phone.startsWith('AH')) {
+      const idx = result.indexOf('ʌ', searchFrom)
+      if (idx !== -1) {
+        searchFrom = idx + 1
+      }
+    }
+  }
+
+  return result
+}
+
+const PUNCTUATION_RE = /^[^a-zA-Z]+|[^a-zA-Z]+$/g
+
+function annotateExample(sentence: string): { word: string; phonetic: string }[] {
+  if (!sentence) return []
+
+  const dict = getIpaDict()
+  const words = sentence.split(/\s+/).filter((w) => w.length > 0)
+
+  return words.map((originalWord) => {
+    const cleaned = originalWord.replace(PUNCTUATION_RE, '').toLowerCase()
+    const phonetic = dict.get(cleaned) || ''
+    return { word: originalWord, phonetic }
+  })
+}
 
 const AI_MODEL = 'deepseek/deepseek-v3.2'
 const FALLBACK_MODEL = 'openai/gpt-4o-mini'
