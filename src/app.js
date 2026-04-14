@@ -172,6 +172,7 @@ let renderFileListFn = null
 let processBtnRef = null
 let activeTab = 'extract'
 let jobPollTimer = null
+let jobFilter = 'all'
 
 function showMainView() {
   selectedFiles = []
@@ -564,12 +565,30 @@ async function loadJobsList() {
 
   const hasActiveJobs = jobs.some((j) => j.status === 'pending' || j.status === 'processing')
 
+  const filterCounts = {
+    all: jobs.length,
+    active: jobs.filter((j) => j.status === 'pending' || j.status === 'processing').length,
+    completed: jobs.filter((j) => j.status === 'completed').length,
+    cancelled: jobs.filter((j) => j.status === 'cancelled').length,
+  }
+
+  const filtered = jobFilter === 'all' ? jobs
+    : jobFilter === 'active' ? jobs.filter((j) => j.status === 'pending' || j.status === 'processing')
+    : jobs.filter((j) => j.status === jobFilter)
+
   jobsSection.innerHTML = `
     <div class="jobs-header">
       <h2>提取任务</h2>
     </div>
+    <div class="job-filters">
+      <button class="job-filter-btn ${jobFilter === 'all' ? 'active' : ''}" data-filter="all">全部 (${filterCounts.all})</button>
+      <button class="job-filter-btn ${jobFilter === 'active' ? 'active' : ''}" data-filter="active">进行中 (${filterCounts.active})</button>
+      <button class="job-filter-btn ${jobFilter === 'completed' ? 'active' : ''}" data-filter="completed">已完成 (${filterCounts.completed})</button>
+      <button class="job-filter-btn ${jobFilter === 'cancelled' ? 'active' : ''}" data-filter="cancelled">已取消 (${filterCounts.cancelled})</button>
+    </div>
+    ${filtered.length === 0 ? '<p class="empty-text">没有匹配的任务</p>' : `
     <div class="jobs-list">
-      ${jobs.map((job) => {
+      ${filtered.map((job) => {
         const statusLabel = getJobStatusLabel(job.status)
         const pct = job.total_count > 0
           ? Math.round(((job.completed_count + job.failed_count) / job.total_count) * 100)
@@ -598,7 +617,16 @@ async function loadJobsList() {
         `
       }).join('')}
     </div>
+    `}
   `
+
+  // Filter button handlers
+  document.querySelectorAll('.job-filter-btn').forEach((btn) => {
+    btn.addEventListener('click', () => {
+      jobFilter = btn.dataset.filter
+      loadJobsList()
+    })
+  })
 
   // Make entire job card clickable
   document.querySelectorAll('.job-card').forEach((card) => {

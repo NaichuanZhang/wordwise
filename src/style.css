@@ -873,6 +873,37 @@ body {
   color: var(--text-primary);
 }
 
+.job-filters {
+  display: flex;
+  gap: 0.35rem;
+  margin-bottom: 0.75rem;
+  flex-wrap: wrap;
+}
+
+.job-filter-btn {
+  padding: 0.3rem 0.75rem;
+  border: 1px solid var(--border);
+  border-radius: 99px;
+  background: var(--bg-card);
+  color: var(--text-secondary);
+  font-family: var(--font-body);
+  font-size: 0.725rem;
+  font-weight: 500;
+  cursor: pointer;
+  transition: all var(--transition);
+}
+
+.job-filter-btn:hover {
+  border-color: var(--accent);
+  color: var(--accent);
+}
+
+.job-filter-btn.active {
+  background: var(--accent);
+  color: var(--text-inverse);
+  border-color: var(--accent);
+}
+
 .jobs-list {
   display: flex;
   flex-direction: column;
