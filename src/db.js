@@ -129,14 +129,28 @@ export async function deleteProcessedFile(userId, fileId, storageKey) {
 // --- Word Entries ---
 
 export async function getAllWordEntries(userId) {
-  const { data, error } = await insforge.database
-    .from('word_entries')
-    .select('*')
-    .eq('user_id', userId)
-    .order('created_at', { ascending: false })
+  const PAGE_SIZE = 1000
+  const allData = []
+  let offset = 0
 
-  if (error) return []
-  return data || []
+  while (true) {
+    const { data, error } = await insforge.database
+      .from('word_entries')
+      .select('*')
+      .eq('user_id', userId)
+      .order('created_at', { ascending: false })
+      .range(offset, offset + PAGE_SIZE - 1)
+
+    if (error) return allData
+    if (!data || data.length === 0) break
+
+    allData.push(...data)
+
+    if (data.length < PAGE_SIZE) break
+    offset += PAGE_SIZE
+  }
+
+  return allData
 }
 
 export async function getWordFrequencyMap(userId) {
