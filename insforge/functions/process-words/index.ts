@@ -1,4 +1,5 @@
 import { createClient } from 'npm:@insforge/sdk'
+import { annotateExample } from './phonetic-annotator.ts'
 
 const AI_MODEL = 'deepseek/deepseek-v3.2'
 const FALLBACK_MODEL = 'openai/gpt-4o-mini'
@@ -246,7 +247,7 @@ async function processBatch(
     })
     .join('\n')
 
-  const prompt = `你是一个专业的英语词典编辑。请为以下每个英语单词提供：音标、词性、中文意思、例句、例句中每个词的音标、例句中文翻译。
+  const prompt = `你是一个专业的英语词典编辑。请为以下每个英语单词提供：音标、词性、中文意思、例句、例句中文翻译。
 
 要求：
 1. 音标用国际音标，格式如 /ˈselɪbreɪt/
@@ -256,8 +257,7 @@ async function processBatch(
    - 如果提供了原文例句且不超过10个词，直接使用原文例句
    - 如果原文例句超过10个词，请根据该单词重新造一个简短（不超过10个词）、通顺的例句
    - 如果没有提供原文例句，请造一个简短的例句
-5. exampleAnnotated：将例句中的每个英文单词标注音标，格式为对象数组，每个对象包含 word 和 phonetic
-6. 例句的中文翻译要自然流畅
+5. 例句的中文翻译要自然流畅
 
 请严格按照以下JSON数组格式输出，不要输出任何其他内容：
 [
@@ -267,14 +267,6 @@ async function processBatch(
     "pos": "v.",
     "meaning": "庆祝",
     "example": "We celebrate this festival in April.",
-    "exampleAnnotated": [
-      {"word": "We", "phonetic": "/wiː/"},
-      {"word": "celebrate", "phonetic": "/ˈselɪbreɪt/"},
-      {"word": "this", "phonetic": "/ðɪs/"},
-      {"word": "festival", "phonetic": "/ˈfestɪvl/"},
-      {"word": "in", "phonetic": "/ɪn/"},
-      {"word": "April.", "phonetic": "/ˈeɪprəl/"}
-    ],
     "exampleCn": "我们在四月庆祝这个节日。"
   }
 ]
@@ -286,7 +278,7 @@ ${wordList}`
     model,
     messages: [{ role: 'user', content: prompt }],
     temperature: 0.3,
-    maxTokens: 4000,
+    maxTokens: 2500,
   })
 
   const content = completion.choices[0].message.content
@@ -307,7 +299,7 @@ function parseAIResponse(content: string, wordEntries: WordEntry[]): DictEntry[]
       pos: (item.pos as string) || '',
       meaning: (item.meaning as string) || '',
       example: (item.example as string) || '',
-      exampleAnnotated: Array.isArray(item.exampleAnnotated) ? item.exampleAnnotated : [],
+      exampleAnnotated: annotateExample((item.example as string) || ''),
       exampleCn: (item.exampleCn as string) || '',
     }))
   } catch {
