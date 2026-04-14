@@ -4,7 +4,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## Project Overview
 
-**WordWise** (汇) — A Chinese-audience web app that extracts English vocabulary from `.docx` files, generates AI-powered dictionary entries (phonetics, POS, meaning, annotated example sentences), and presents results in a table with CSV export. Includes a persistent file library, dictionary browser, and processing status with retry for failed AI generations.
+**WordWise** (汇) — A Chinese-audience web app that extracts English vocabulary from `.docx` files, generates AI-powered dictionary entries (phonetics, POS, meaning, annotated example sentences), and presents results in a table with CSV export. Features background job processing, persistent file library, dictionary browser, and job progress visualization.
 
 ## Commands
 
@@ -18,14 +18,14 @@ No test framework or linter configured.
 
 ## Architecture
 
-Vanilla JS SPA (no framework) using Vite as bundler. All source in `src/`. UI is rendered via imperative DOM manipulation (`innerHTML` + event listeners) in `app.js`. State is managed via module-level variables (`currentUser`, `selectedFiles`, `activeTab`, `lastFailedWordEntries`, etc.).
+Vanilla JS SPA (no framework) using Vite as bundler. All source in `src/`. UI is rendered via imperative DOM manipulation (`innerHTML` + event listeners) in `app.js`. State is managed via module-level variables (`currentUser`, `selectedFiles`, `activeTab`, `jobFilter`, etc.).
 
 All user-facing text is in Chinese. HTML output is escaped via `escapeHtml()` and `csvEscape()` helpers in `app.js`.
 
 ### Navigation
 
 Two tabs in the main view:
-- **提取** (Extract) — Upload/select files, process words, view results with status summary and retry
+- **提取** (Extract) — Upload/select files, create background extraction jobs, view job progress with visualization, cancel jobs
 - **词典** (Dictionary) — Browse all persisted word entries with search, POS filter, sort by frequency/alpha/date
 
 ### Data Flow
@@ -36,13 +36,14 @@ Two tabs in the main view:
 4. **Parse** (`docx-parser.js`) — `mammoth` extracts raw text from `.docx`. Sentences and English words extracted via regex.
 5. **Rank** (`word-ranker.js`) — Words scored by length, morphological complexity (prefix/suffix patterns), and curated difficulty/basic word lists. Stop words filtered.
 6. **Cache Check** (`db.js`) — Processed files and word entries cached per-user in InsForge Postgres tables. File dedup uses `file_hash`; word entries use `(user_id, word)` unique constraint with upsert.
-7. **AI Generation** (`ai-dictionary.js`) — Cascading retry pipeline:
-   - Pass 1: Batches of 10, 3 concurrent → DeepSeek V3.2
+7. **Background Job** (`app.js` + `db.js`) — Uncached words are submitted as an `extraction_jobs` record. The `process-words` edge function is triggered immediately for the first batch, then a cron continues processing every minute.
+8. **AI Generation** (`insforge/functions/process-words/index.ts`) — Server-side cascading retry pipeline:
+   - Pass 1: Batch of 10, 3 concurrent → DeepSeek V3.2
    - Pass 2: Individual retry, 5 concurrent → DeepSeek V3.2
    - Pass 3: Individual retry, 5 concurrent → GPT-4o-mini (fallback)
-   - `isFailed(entry)` exported — checks for empty required fields or `(生成失败)` meaning
-8. **Display** (`app.js`) — Results table with status summary (cached/new/failed counts), retry button for failed entries, annotated examples (per-word phonetics). CSV excludes failed entries.
-9. **Dictionary** (`app.js`) — Loads all word entries + computes total word frequency across all `processed_files.word_freq` maps. Search, POS filter, sort by frequency/alpha/newest.
+   - Example sentences annotated with phonetics via CMU Pronouncing Dictionary (deterministic, no LLM)
+9. **Job Visualization** (`app.js`) — SVG progress ring, word status grid (green/red/gray pills), live polling every 5s. Click word pills for popover details. Job filter tabs (all/active/completed/cancelled). Cancel button for active jobs.
+10. **Dictionary** (`app.js`) — Loads all word entries + computes total word frequency across all `processed_files.word_freq` maps. Search, POS filter, sort by frequency/alpha/newest.
 
 ### Backend (InsForge)
 
@@ -51,9 +52,12 @@ Two tabs in the main view:
 - **Database tables**:
   - `processed_files`: `user_id`, `file_hash`, `file_name`, `raw_words` (jsonb), `sentences` (jsonb), `storage_key`, `word_freq` (jsonb — `{word: count}` map for frequency aggregation), `created_at`
   - `word_entries`: `user_id`, `word` (unique per user), `phonetic`, `pos`, `meaning`, `example`, `example_annotated` (jsonb array of `{word, phonetic}`), `example_cn`, `created_at`
-  - `extraction_jobs`: `user_id`, `status` (pending/processing/completed/failed), `file_names` (jsonb), `words` (jsonb), `results` (jsonb), `failed_words` (jsonb), `total_count`, `completed_count`, `failed_count`, `batch_index`, `created_at`, `updated_at`
+  - `extraction_jobs`: `user_id`, `status` (pending/processing/completed/cancelled), `file_names` (jsonb), `words` (jsonb), `results` (jsonb), `failed_words` (jsonb), `total_count`, `completed_count`, `failed_count`, `batch_index`, `created_at`, `updated_at`
+- **Edge function** `process-words` — AI dictionary generation with cascading retry + CMU phonetic annotation. Dispatch mode (no `job_id` → finds active jobs) and single-job mode. Cron calls every minute in dispatch mode.
+- **Database functions** (SECURITY DEFINER, bypass RLS): `get_active_extraction_jobs()`, `get_extraction_job_by_id(uuid)`, `update_extraction_job(...)`, `upsert_word_entries(jsonb)`
 - **AI**: Proxied LLM calls via `insforge.ai.chat.completions.create()`. Models: `deepseek/deepseek-v3.2` (primary), `openai/gpt-4o-mini` (fallback).
-- **RLS**: All tables use row-level security with `auth.uid()` policies.
+- **RLS**: All tables use row-level security with `auth.uid()` policies. Edge functions use SECURITY DEFINER RPCs.
+- **Cron**: Every minute, calls `process-words` in dispatch mode (10 words per active job per tick).
 
 ### Key Module Responsibilities
 
@@ -64,8 +68,7 @@ Two tabs in the main view:
 | `db.js` | All database operations — file cache CRUD, word entry cache/upsert, file hash computation, storage upload/delete, word frequency map |
 | `docx-parser.js` | `.docx` → text → sentences + word list extraction |
 | `word-ranker.js` | Difficulty scoring, stop-word filtering, frequency aggregation, example sentence lookup |
-| `ai-dictionary.js` | Cascading AI dictionary generation: batch → individual retry → model fallback. Exports `isFailed()` for entry validation. |
-| `app.js` | All UI rendering (~1000 lines), tab routing (extract ↔ dictionary), file library, processing status/retry, event handling |
+| `app.js` | All UI rendering (~1000 lines), tab routing (extract ↔ dictionary), file library, job visualization, event handling |
 | `style.css` | Full styling (~1000 lines) — warm palette, responsive, Claude-inspired design |
 
 ## Deployment

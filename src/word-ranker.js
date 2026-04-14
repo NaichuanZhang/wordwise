@@ -151,10 +151,6 @@ export function rankWords(words) {
   return scored.sort((a, b) => b.score - a.score)
 }
 
-export function getTopWords(rankedWords, limit = 100) {
-  return rankedWords.slice(0, limit).map((item) => item.word)
-}
-
 export function aggregateFrequencies(allRankedWords) {
   const freqMap = new Map()
   for (const item of allRankedWords) {
