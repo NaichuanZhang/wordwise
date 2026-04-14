@@ -227,6 +227,8 @@ function showUploadView() {
 
 function showExtractTab() {
   stopJobPolling()
+  stopJobDetailPolling()
+  activeJobDetailId = null
   const content = document.getElementById('tab-content')
   content.innerHTML = `
         <div class="upload-section">
@@ -589,18 +591,17 @@ async function loadJobsList() {
               <div class="job-progress-bar"><div class="job-progress-fill" style="width: ${pct}%"></div></div>
               <span class="job-counts">${job.completed_count}/${job.total_count} 完成${job.failed_count > 0 ? `，${job.failed_count} 失败` : ''}</span>
             </div>
-            ${job.status === 'completed' || job.completed_count > 0 ? `<button class="btn-text job-view-btn" data-job-id="${job.id}">查看结果</button>` : ''}
           </div>
         `
       }).join('')}
     </div>
   `
 
-  // Attach view handlers
-  document.querySelectorAll('.job-view-btn').forEach((btn) => {
-    btn.addEventListener('click', (e) => {
-      e.stopPropagation()
-      viewJobResults(btn.dataset.jobId)
+  // Make entire job card clickable
+  document.querySelectorAll('.job-card').forEach((card) => {
+    card.style.cursor = 'pointer'
+    card.addEventListener('click', () => {
+      showJobDetail(card.dataset.jobId)
     })
   })
 
@@ -635,10 +636,16 @@ function stopJobPolling() {
   }
 }
 
-async function viewJobResults(jobId) {
+let jobDetailPollTimer = null
+let activeJobDetailId = null
+
+async function showJobDetail(jobId) {
+  activeJobDetailId = jobId
+  stopJobDetailPolling()
+
   const resultsSection = document.getElementById('results-section')
   resultsSection.classList.remove('hidden')
-  resultsSection.innerHTML = '<p class="loading-text">加载结果...</p>'
+  resultsSection.innerHTML = '<p class="loading-text">加载任务详情...</p>'
 
   const job = await getExtractionJob(jobId)
   if (!job) {
@@ -646,7 +653,265 @@ async function viewJobResults(jobId) {
     return
   }
 
-  const results = (job.results || []).map((e) => ({
+  renderJobDetail(job)
+
+  if (job.status === 'pending' || job.status === 'processing') {
+    startJobDetailPolling(jobId)
+  }
+}
+
+function renderJobDetail(job) {
+  const resultsSection = document.getElementById('results-section')
+  const allWords = job.words || []
+  const results = job.results || []
+  const failedWords = job.failed_words || []
+  const resultWordSet = new Set(results.map((r) => r.word))
+  const failedWordSet = new Set(failedWords)
+
+  const completedCount = results.length
+  const failedCount = failedWords.length
+  const pendingCount = allWords.length - completedCount - failedCount
+  const pct = job.total_count > 0 ? Math.round(((completedCount + failedCount) / job.total_count) * 100) : 0
+
+  const fileNames = (job.file_names || []).join(', ')
+  const createdDate = new Date(job.created_at).toLocaleString('zh-CN')
+  const statusLabel = getJobStatusLabel(job.status)
+  const isActive = job.status === 'pending' || job.status === 'processing'
+
+  resultsSection.innerHTML = `
+    <div class="job-detail">
+      <button class="btn-back" id="btn-back-jobs">← 返回任务列表</button>
+      <div class="job-detail-header">
+        <div>
+          <h2 class="job-detail-title">${escapeHtml(fileNames)}</h2>
+          <span class="job-detail-date">${createdDate}</span>
+        </div>
+        <span class="job-status job-status-${job.status}">${statusLabel}</span>
+      </div>
+
+      <div class="job-viz">
+        <div class="progress-ring-container" id="progress-ring">
+          ${renderProgressRing(completedCount, failedCount, pendingCount, pct)}
+        </div>
+        <div class="stats-row" id="stats-row">
+          <div class="stat-card">
+            <span class="stat-value">${job.total_count}</span>
+            <span class="stat-label">总词数</span>
+          </div>
+          <div class="stat-card stat-card-success">
+            <span class="stat-value">${completedCount}</span>
+            <span class="stat-label">已完成</span>
+          </div>
+          <div class="stat-card stat-card-failed">
+            <span class="stat-value">${failedCount}</span>
+            <span class="stat-label">失败</span>
+          </div>
+          <div class="stat-card stat-card-pending">
+            <span class="stat-value">${pendingCount}</span>
+            <span class="stat-label">等待中</span>
+          </div>
+          <div class="stat-card">
+            <span class="stat-value">${job.batch_index || 0}</span>
+            <span class="stat-label">批次</span>
+          </div>
+        </div>
+      </div>
+
+      <div class="word-grid-section">
+        <h3 class="word-grid-title">词汇状态</h3>
+        <div class="word-grid" id="word-grid">
+          ${renderWordGrid(allWords, resultWordSet, failedWordSet, results)}
+        </div>
+      </div>
+
+      ${completedCount > 0 ? `
+        <div class="job-results-section">
+          <h3 class="word-grid-title">已完成词条</h3>
+          <div id="job-results-table"></div>
+        </div>
+      ` : ''}
+    </div>
+  `
+
+  // Render results table if there are completed entries
+  if (completedCount > 0) {
+    renderResultsTable(results)
+  }
+
+  document.getElementById('btn-back-jobs').addEventListener('click', () => {
+    stopJobDetailPolling()
+    activeJobDetailId = null
+    resultsSection.classList.add('hidden')
+    resultsSection.innerHTML = ''
+    loadJobsList()
+  })
+
+  // Popover click handler for completed word pills
+  setupWordPillPopovers(results)
+}
+
+function renderProgressRing(completed, failed, pending, pct) {
+  const total = completed + failed + pending
+  if (total === 0) return ''
+
+  const radius = 52
+  const circumference = 2 * Math.PI * radius
+  const completedLen = (completed / total) * circumference
+  const failedLen = (failed / total) * circumference
+  const pendingLen = circumference - completedLen - failedLen
+
+  const completedOffset = 0
+  const failedOffset = completedLen
+  const pendingOffset = completedLen + failedLen
+
+  return `
+    <svg class="progress-ring" width="130" height="130" viewBox="0 0 130 130">
+      <circle cx="65" cy="65" r="${radius}" fill="none" stroke="#E8E2DA" stroke-width="10" />
+      ${completedLen > 0 ? `<circle cx="65" cy="65" r="${radius}" fill="none" stroke="#27AE60" stroke-width="10"
+        stroke-dasharray="${completedLen} ${circumference - completedLen}"
+        stroke-dashoffset="${-completedOffset}"
+        stroke-linecap="round" transform="rotate(-90 65 65)" />` : ''}
+      ${failedLen > 0 ? `<circle cx="65" cy="65" r="${radius}" fill="none" stroke="#B91C1C" stroke-width="10"
+        stroke-dasharray="${failedLen} ${circumference - failedLen}"
+        stroke-dashoffset="${-failedOffset}"
+        stroke-linecap="round" transform="rotate(-90 65 65)" />` : ''}
+      <text x="65" y="60" text-anchor="middle" class="progress-pct">${pct}%</text>
+      <text x="65" y="78" text-anchor="middle" class="progress-sub">完成</text>
+    </svg>
+  `
+}
+
+function renderWordGrid(allWords, resultWordSet, failedWordSet, results) {
+  return allWords.map((w) => {
+    const word = w.word
+    let cls = 'word-pill word-pill-pending'
+    let extra = ''
+    if (resultWordSet.has(word)) {
+      cls = 'word-pill word-pill-completed'
+      extra = 'data-word="' + escapeHtml(word) + '"'
+    } else if (failedWordSet.has(word)) {
+      cls = 'word-pill word-pill-failed'
+    }
+    return `<span class="${cls}" ${extra}>${escapeHtml(word)}</span>`
+  }).join('')
+}
+
+function setupWordPillPopovers(results) {
+  const resultMap = new Map(results.map((r) => [r.word, r]))
+
+  document.querySelectorAll('.word-pill-completed').forEach((pill) => {
+    pill.addEventListener('click', (e) => {
+      e.stopPropagation()
+      // Remove any existing popover
+      document.querySelectorAll('.word-popover').forEach((p) => p.remove())
+
+      const word = pill.dataset.word
+      const entry = resultMap.get(word)
+      if (!entry) return
+
+      const popover = document.createElement('div')
+      popover.className = 'word-popover'
+      popover.innerHTML = `
+        <div class="popover-word">${escapeHtml(entry.word)}</div>
+        <div class="popover-phonetic">${escapeHtml(entry.phonetic)}</div>
+        <div class="popover-pos">${escapeHtml(entry.pos)}</div>
+        <div class="popover-meaning">${escapeHtml(entry.meaning)}</div>
+        <div class="popover-example">${escapeHtml(entry.example)}</div>
+        <div class="popover-example-cn">${escapeHtml(entry.exampleCn)}</div>
+      `
+
+      const rect = pill.getBoundingClientRect()
+      popover.style.position = 'fixed'
+      popover.style.left = `${rect.left}px`
+      popover.style.top = `${rect.bottom + 6}px`
+      document.body.appendChild(popover)
+
+      // Ensure popover stays in viewport
+      const popRect = popover.getBoundingClientRect()
+      if (popRect.right > window.innerWidth - 8) {
+        popover.style.left = `${window.innerWidth - popRect.width - 8}px`
+      }
+      if (popRect.bottom > window.innerHeight - 8) {
+        popover.style.top = `${rect.top - popRect.height - 6}px`
+      }
+
+      const dismiss = () => {
+        popover.remove()
+        document.removeEventListener('click', dismiss)
+      }
+      setTimeout(() => document.addEventListener('click', dismiss), 0)
+    })
+  })
+}
+
+function updateJobDetail(job) {
+  const allWords = job.words || []
+  const results = job.results || []
+  const failedWords = job.failed_words || []
+  const resultWordSet = new Set(results.map((r) => r.word))
+  const failedWordSet = new Set(failedWords)
+
+  const completedCount = results.length
+  const failedCount = failedWords.length
+  const pendingCount = allWords.length - completedCount - failedCount
+  const pct = job.total_count > 0 ? Math.round(((completedCount + failedCount) / job.total_count) * 100) : 0
+
+  // Update progress ring
+  const ringEl = document.getElementById('progress-ring')
+  if (ringEl) ringEl.innerHTML = renderProgressRing(completedCount, failedCount, pendingCount, pct)
+
+  // Update stats
+  const statsEl = document.getElementById('stats-row')
+  if (statsEl) {
+    const values = statsEl.querySelectorAll('.stat-value')
+    if (values.length >= 5) {
+      values[0].textContent = job.total_count
+      values[1].textContent = completedCount
+      values[2].textContent = failedCount
+      values[3].textContent = pendingCount
+      values[4].textContent = job.batch_index || 0
+    }
+  }
+
+  // Update word grid
+  const gridEl = document.getElementById('word-grid')
+  if (gridEl) {
+    gridEl.innerHTML = renderWordGrid(allWords, resultWordSet, failedWordSet, results)
+    setupWordPillPopovers(results)
+  }
+
+  // Update status badge
+  const statusBadge = document.querySelector('.job-detail-header .job-status')
+  if (statusBadge) {
+    statusBadge.className = `job-status job-status-${job.status}`
+    statusBadge.textContent = getJobStatusLabel(job.status)
+  }
+
+  // If job just completed, render the results table
+  if ((job.status === 'completed' || completedCount > 0) && !document.getElementById('job-results-table')) {
+    const detail = document.querySelector('.job-detail')
+    if (detail) {
+      const section = document.createElement('div')
+      section.className = 'job-results-section'
+      section.innerHTML = '<h3 class="word-grid-title">已完成词条</h3><div id="job-results-table"></div>'
+      detail.appendChild(section)
+    }
+  }
+  if (completedCount > 0) {
+    renderResultsTable(results)
+  }
+
+  // Stop polling if job is done
+  if (job.status === 'completed' || job.status === 'failed') {
+    stopJobDetailPolling()
+  }
+}
+
+function renderResultsTable(results) {
+  const container = document.getElementById('job-results-table')
+  if (!container) return
+
+  const entries = results.map((e) => ({
     word: e.word,
     phonetic: e.phonetic,
     pos: e.pos,
@@ -654,57 +919,13 @@ async function viewJobResults(jobId) {
     example: e.example,
     exampleAnnotated: e.exampleAnnotated || [],
     exampleCn: e.exampleCn,
-    failed: false,
   }))
 
-  const failedEntries = (job.failed_words || []).map((word) => ({
-    word,
-    phonetic: '',
-    pos: '',
-    meaning: '(生成失败)',
-    example: '',
-    exampleAnnotated: [],
-    exampleCn: '',
-    failed: true,
-  }))
-
-  const allEntries = [...results, ...failedEntries]
-  const stats = {
-    cachedCount: 0,
-    newSuccessCount: results.length,
-    failedCount: failedEntries.length,
-  }
-
-  showResults(allEntries, stats)
-}
-
-// --- Results ---
-
-function showResults(entries, stats) {
-  const resultsSection = document.getElementById('results-section')
-  resultsSection.classList.remove('hidden')
-
-  const failedCount = stats ? stats.failedCount : 0
-
-  const statusParts = []
-  if (stats && stats.cachedCount > 0) statusParts.push(`已缓存 ${stats.cachedCount} 个`)
-  if (stats && stats.newSuccessCount > 0) statusParts.push(`已生成 ${stats.newSuccessCount} 个`)
-  if (failedCount > 0) statusParts.push(`<span class="status-failed">失败 ${failedCount} 个</span>`)
-
-  resultsSection.innerHTML = `
-    <div class="results-header">
-      <h2>提取结果</h2>
-      <div class="results-actions">
-        <span class="results-count">共 ${entries.length} 个单词</span>
-        <button id="download-csv-btn" class="btn-secondary">下载 CSV</button>
-      </div>
-    </div>
-    ${statusParts.length > 0 ? `<div class="results-status">${statusParts.join(' · ')}</div>` : ''}
-    <div id="table-container"></div>
-  `
-
-  const container = document.getElementById('table-container')
   container.innerHTML = `
+    <div class="results-actions" style="margin-bottom: 0.75rem">
+      <span class="results-count">${entries.length} 个词条</span>
+      <button id="job-download-csv-btn" class="btn-secondary">下载 CSV</button>
+    </div>
     <div class="results-table-container">
       <table class="results-table">
         <thead>
@@ -720,14 +941,14 @@ function showResults(entries, stats) {
         </thead>
         <tbody>
           ${entries.map((entry, i) => `
-            <tr class="${entry.failed ? 'row-failed' : ''}">
+            <tr>
               <td class="col-num">${i + 1}</td>
               <td class="col-word"><strong>${escapeHtml(entry.word)}</strong></td>
               <td class="col-phonetic">${escapeHtml(entry.phonetic)}</td>
               <td class="col-pos">${escapeHtml(entry.pos)}</td>
-              <td class="col-meaning">${entry.failed ? '<span class="badge-failed">生成失败</span>' : escapeHtml(entry.meaning)}</td>
-              <td class="col-example">${entry.failed ? '' : renderAnnotatedExample(entry)}</td>
-              <td class="col-example-cn">${entry.failed ? '' : escapeHtml(entry.exampleCn)}</td>
+              <td class="col-meaning">${escapeHtml(entry.meaning)}</td>
+              <td class="col-example">${renderAnnotatedExample(entry)}</td>
+              <td class="col-example-cn">${escapeHtml(entry.exampleCn)}</td>
             </tr>
           `).join('')}
         </tbody>
@@ -735,8 +956,28 @@ function showResults(entries, stats) {
     </div>
   `
 
-  document.getElementById('download-csv-btn').addEventListener('click', () => downloadCSV(entries.filter((e) => !e.failed)))
+  document.getElementById('job-download-csv-btn')?.addEventListener('click', () => downloadCSV(entries))
 }
+
+function startJobDetailPolling(jobId) {
+  stopJobDetailPolling()
+  jobDetailPollTimer = setInterval(async () => {
+    if (activeJobDetailId !== jobId) {
+      stopJobDetailPolling()
+      return
+    }
+    const job = await getExtractionJob(jobId)
+    if (job) updateJobDetail(job)
+  }, 5000)
+}
+
+function stopJobDetailPolling() {
+  if (jobDetailPollTimer) {
+    clearInterval(jobDetailPollTimer)
+    jobDetailPollTimer = null
+  }
+}
+
 
 function renderAnnotatedExample(entry) {
   const annotated = entry.exampleAnnotated
