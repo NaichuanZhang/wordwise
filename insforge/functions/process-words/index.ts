@@ -38,43 +38,49 @@ export default async function (req: Request): Promise<Response> {
     return new Response(null, { status: 204, headers: corsHeaders })
   }
 
-  const authHeader = req.headers.get('Authorization')
-  const userToken = authHeader ? authHeader.replace('Bearer ', '') : null
+  const baseUrl = Deno.env.get('INSFORGE_BASE_URL')!
+  const anonKey = Deno.env.get('ANON_KEY')!
 
-  // For cron invocations, use API key; for user invocations, use user token
-  const apiKey = req.headers.get('X-API-Key')
-  const client = apiKey
-    ? createClient({
-        baseUrl: Deno.env.get('INSFORGE_BASE_URL')!,
-        apiKey,
-      })
-    : createClient({
-        baseUrl: Deno.env.get('INSFORGE_BASE_URL')!,
-        edgeFunctionToken: userToken,
-      })
+  const client = createClient({ baseUrl, anonKey })
 
-  const body = await req.json()
-  const { job_id } = body
+  const body = await req.json().catch(() => ({}))
+  let { job_id } = body
 
+  // Dispatch mode: if no job_id, find one active job and process it
   if (!job_id) {
-    return jsonResponse({ error: 'job_id required' }, 400)
+    const { data: activeJobs } = await client.database.rpc('get_active_extraction_jobs')
+    if (!activeJobs || activeJobs.length === 0) {
+      return jsonResponse({ processed: 0, message: 'No pending jobs' })
+    }
+    // Process only the first job per invocation (cron runs every minute)
+    const result = await processJob(client, activeJobs[0].id, activeJobs[0])
+    return jsonResponse({ processed: 1, ...result })
   }
 
-  // Load job
-  const { data: jobs, error: jobErr } = await client.database
-    .from('extraction_jobs')
-    .select('*')
-    .eq('id', job_id)
-    .limit(1)
+  // Single job mode (client-triggered, can use larger batch)
+  const result = await processJob(client, job_id, undefined, BATCH_SIZE * CONCURRENCY)
+  return jsonResponse(result)
+}
 
-  if (jobErr || !jobs || jobs.length === 0) {
-    return jsonResponse({ error: 'Job not found' }, 404)
+async function processJob(
+  client: ReturnType<typeof createClient>,
+  job_id: string,
+  preloadedJob?: Record<string, unknown>,
+  batchLimit: number = BATCH_SIZE,
+): Promise<Record<string, unknown>> {
+  // Load job via SECURITY DEFINER RPC (bypasses RLS)
+  let job = preloadedJob
+  if (!job) {
+    const { data: jobs, error: jobErr } = await client.database
+      .rpc('get_extraction_job_by_id', { p_job_id: job_id })
+    if (jobErr || !jobs || jobs.length === 0) {
+      return { error: 'Job not found', job_id }
+    }
+    job = jobs[0]
   }
-
-  const job = jobs[0]
 
   if (job.status === 'completed') {
-    return jsonResponse({ status: 'completed', completed_count: job.completed_count })
+    return { job_id, status: 'completed', completed_count: job.completed_count }
   }
 
   // Calculate which words still need processing
@@ -88,20 +94,14 @@ export default async function (req: Request): Promise<Response> {
   const remaining = allWords.filter((w) => !processedWords.has(w.word))
 
   if (remaining.length === 0) {
-    await updateJob(client, job_id, {
-      status: 'completed',
-      updated_at: new Date().toISOString(),
-    })
-    return jsonResponse({ status: 'completed', completed_count: job.completed_count })
+    await client.database.rpc('update_extraction_job', { p_job_id: job_id, p_status: 'completed' })
+    return { job_id, status: 'completed', completed_count: job.completed_count }
   }
 
-  // Process next batch (~30 words per invocation)
-  const batchWords = remaining.slice(0, BATCH_SIZE * CONCURRENCY)
+  // Process next batch (batchLimit words per invocation)
+  const batchWords = remaining.slice(0, batchLimit)
 
-  await updateJob(client, job_id, {
-    status: 'processing',
-    updated_at: new Date().toISOString(),
-  })
+  await client.database.rpc('update_extraction_job', { p_job_id: job_id, p_status: 'processing' })
 
   // Pass 1: Batch processing with primary model
   const pass1Results = await runBatches(client, batchWords, BATCH_SIZE, CONCURRENCY, AI_MODEL)
@@ -145,7 +145,7 @@ export default async function (req: Request): Promise<Response> {
     }
   }
 
-  // Save successful word entries to word_entries table
+  // Save successful word entries via SECURITY DEFINER RPC
   if (succeeded.length > 0 && job.user_id) {
     const rows = succeeded.map((entry) => ({
       user_id: job.user_id,
@@ -158,12 +158,10 @@ export default async function (req: Request): Promise<Response> {
       example_cn: entry.exampleCn,
     }))
 
-    await client.database
-      .from('word_entries')
-      .upsert(rows, { onConflict: 'user_id,word' })
+    await client.database.rpc('upsert_word_entries', { p_entries: rows })
   }
 
-  // Update job with new results
+  // Update job with new results via RPC
   const allResults = [...existingResults, ...succeeded]
   const newRemaining = allWords.filter((w) =>
     !allResults.some((r) => r.word === w.word)
@@ -171,22 +169,23 @@ export default async function (req: Request): Promise<Response> {
   )
 
   const isComplete = newRemaining.length === 0
-  await updateJob(client, job_id, {
-    status: isComplete ? 'completed' : 'processing',
-    results: allResults,
-    failed_words: existingFailed,
-    completed_count: allResults.length,
-    failed_count: existingFailed.length,
-    batch_index: job.batch_index + 1,
-    updated_at: new Date().toISOString(),
+  await client.database.rpc('update_extraction_job', {
+    p_job_id: job_id,
+    p_status: isComplete ? 'completed' : 'processing',
+    p_results: allResults,
+    p_failed_words: existingFailed,
+    p_completed_count: allResults.length,
+    p_failed_count: existingFailed.length,
+    p_batch_index: job.batch_index + 1,
   })
 
-  return jsonResponse({
+  return {
+    job_id,
     status: isComplete ? 'completed' : 'processing',
     completed_count: allResults.length,
     failed_count: existingFailed.length,
     remaining: newRemaining.length,
-  })
+  }
 }
 
 // --- AI Processing ---
@@ -325,17 +324,6 @@ function fallbackEntries(wordEntries: WordEntry[]): DictEntry[] {
     exampleAnnotated: [],
     exampleCn: '',
   }))
-}
-
-async function updateJob(
-  client: ReturnType<typeof createClient>,
-  jobId: string,
-  updates: Record<string, unknown>,
-) {
-  await client.database
-    .from('extraction_jobs')
-    .update(updates)
-    .eq('id', jobId)
 }
 
 function jsonResponse(data: unknown, status = 200): Response {

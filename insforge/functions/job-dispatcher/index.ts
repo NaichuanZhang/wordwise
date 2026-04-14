@@ -12,41 +12,37 @@ export default async function (req: Request): Promise<Response> {
   }
 
   const baseUrl = Deno.env.get('INSFORGE_BASE_URL')!
-  const apiKey = req.headers.get('X-API-Key') || Deno.env.get('API_KEY')!
+  const anonKey = Deno.env.get('ANON_KEY')!
 
-  const client = createClient({ baseUrl, apiKey })
+  const client = createClient({ baseUrl, anonKey })
 
-  // Find jobs that need processing
-  const { data: jobs, error } = await client.database
-    .from('extraction_jobs')
-    .select('id')
-    .in('status', ['pending', 'processing'])
-    .order('created_at', { ascending: true })
-    .limit(5)
+  // Find active jobs via SECURITY DEFINER RPC (bypasses RLS)
+  const { data: jobs, error } = await client.database.rpc('get_active_extraction_jobs')
 
   if (error || !jobs || jobs.length === 0) {
-    return jsonResponse({ processed: 0, message: 'No pending jobs' })
+    return jsonResponse({
+      processed: 0,
+      message: 'No pending jobs',
+      debug: { error: error?.message },
+    })
   }
 
-  // Invoke process-words for each job
-  const results = await Promise.all(
-    jobs.map(async (job: { id: string }) => {
-      try {
-        const resp = await fetch(`${baseUrl}/functions/process-words`, {
-          method: 'POST',
-          headers: {
-            'Content-Type': 'application/json',
-            'X-API-Key': apiKey,
-          },
-          body: JSON.stringify({ job_id: job.id }),
-        })
-        const data = await resp.json()
-        return { job_id: job.id, ...data }
-      } catch (err) {
-        return { job_id: job.id, error: String(err) }
+  // Invoke process-words for each job sequentially via SDK
+  const results = []
+  for (const job of jobs) {
+    try {
+      const { data, error: invokeErr } = await client.functions.invoke('process-words', {
+        body: { job_id: job.id },
+      })
+      if (invokeErr) {
+        results.push({ job_id: job.id, error: invokeErr.message })
+      } else {
+        results.push({ job_id: job.id, ...data })
       }
-    })
-  )
+    } catch (err) {
+      results.push({ job_id: job.id, error: String(err) })
+    }
+  }
 
   return jsonResponse({ processed: results.length, results })
 }
